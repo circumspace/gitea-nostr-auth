@@ -1,0 +1,6 @@
+# Binaries (at root only)
+/nostr-oauth2-server
+/nostr-oauth2-server-*
+
+# Config with secrets
+config.production.yaml

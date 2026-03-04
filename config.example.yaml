@@ -1,0 +1,33 @@
+# Nostr OAuth2 Server Configuration
+
+server:
+  # Port to listen on
+  port: 8080
+  # Host to bind to (empty or 0.0.0.0 for all interfaces)
+  host: ""
+  # Public base URL (used for generating redirect URLs)
+  base_url: "http://localhost:8080"
+
+oauth2:
+  clients:
+    # Gitea client configuration
+    - client_id: "gitea"
+      # Generate a secure secret: openssl rand -hex 32
+      client_secret: "change-me-to-a-secure-secret"
+      redirect_uris:
+        - "http://localhost:3000/user/oauth2/nostr/callback"
+        # Add your production Gitea URL here
+        # - "https://gitea.example.com/user/oauth2/nostr/callback"
+
+nostr:
+  # How long a challenge is valid
+  challenge_ttl: 60s
+  # Fallback relays for fetching relay lists and profiles
+  # These are used when looking up NIP-65 relay lists and kind 0 profiles
+  # Leave empty to use defaults: relay.nostr.band, nostr.wine, nos.lol, relay.primal.net, purplepag.es
+  fallback_relays:
+    - "wss://relay.nostr.band/"
+    - "wss://nostr.wine/"
+    - "wss://nos.lol/"
+    - "wss://relay.primal.net/"
+    - "wss://purplepag.es/"
