@@ -283,6 +283,7 @@ func (c *conversation) run(ctx context.Context) (*gonostr.Event, error) {
 	if err := conn.Write(ctx, websocket.MessageText, req); err != nil {
 		return nil, c.relayErr(ctx, err)
 	}
+	c.logf("subscribed on %s", c.m.opts.Relay)
 
 	for handled := 0; handled < maxEventsHandled; {
 		_, data, err := conn.Read(ctx)
@@ -323,6 +324,7 @@ func (c *conversation) run(ctx context.Context) (*gonostr.Event, error) {
 			handled++
 			var ev gonostr.Event
 			if json.Unmarshal(msg[2], &ev) != nil || !filter.Matches(&ev) || !nostr.ValidEvent(&ev) {
+				c.logf("dropped an invalid or unexpected event from the relay")
 				continue
 			}
 			signed, err := c.handle(ctx, &ev)
@@ -340,20 +342,29 @@ func (c *conversation) run(ctx context.Context) (*gonostr.Event, error) {
 func (c *conversation) handle(ctx context.Context, ev *gonostr.Event) (*gonostr.Event, error) {
 	resp, ok := c.decrypt(ev)
 	if !ok {
+		c.logf("ignored a message from %s that does not decrypt", short(ev.PubKey))
 		return nil, nil
 	}
 
 	if c.signer == "" {
 		if subtle.ConstantTimeCompare([]byte(resp.Result), []byte(c.secret)) != 1 {
+			c.logf("ignored a message from %s without the session secret (id %q, error %q)", short(ev.PubKey), truncate(resp.ID), truncate(resp.Error))
 			return nil, nil
 		}
 		c.signer = ev.PubKey
+		c.logf("signer %s connected, sending the sign request", short(ev.PubKey))
 		return nil, c.requestSignature(ctx)
 	}
 
-	if ev.PubKey != c.signer || resp.ID != c.requestID {
+	if ev.PubKey != c.signer {
+		c.logf("ignored a message from %s, which is not the session's signer", short(ev.PubKey))
 		return nil, nil
 	}
+	if resp.ID != c.requestID {
+		c.logf("ignored a response for request %q, expected %q", truncate(resp.ID), c.requestID)
+		return nil, nil
+	}
+	c.logf("signer answered the sign request")
 	if resp.Result == "auth_url" {
 		return nil, errors.New("the signer asked for a web authorization step, which is not supported")
 	}
@@ -442,6 +453,17 @@ func (c *conversation) relayErr(ctx context.Context, err error) error {
 	}
 	log.Printf("nip46: relay %s: %v", c.m.opts.Relay, err)
 	return errors.New("lost the connection to the signer relay")
+}
+
+func (c *conversation) logf(format string, args ...any) {
+	log.Printf("nip46 %s: "+format, append([]any{short(c.pk)}, args...)...)
+}
+
+func short(pubkey string) string {
+	if len(pubkey) > 8 {
+		return pubkey[:8]
+	}
+	return pubkey
 }
 
 func truncate(s string) string {

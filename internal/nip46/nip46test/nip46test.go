@@ -197,6 +197,7 @@ func (s *Signer) Connect(ctx context.Context, uri string) error {
 		return err
 	}
 	defer c.CloseNow()
+	var lastSent string
 	send := func(v any) error {
 		b, _ := json.Marshal(v)
 		return c.Write(ctx, websocket.MessageText, b)
@@ -215,7 +216,37 @@ func (s *Signer) Connect(ctx context.Context, uri string) error {
 		if err := ev.Sign(signerSK); err != nil {
 			return err
 		}
+		lastSent = ev.ID
 		return send([]any{"EVENT", ev})
+	}
+	awaitOK := func(id string) error {
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				return err
+			}
+			var msg []json.RawMessage
+			if json.Unmarshal(data, &msg) != nil || len(msg) < 3 {
+				continue
+			}
+			var label, got string
+			var accepted bool
+			_ = json.Unmarshal(msg[0], &label)
+			_ = json.Unmarshal(msg[1], &got)
+			_ = json.Unmarshal(msg[2], &accepted)
+			if label == "OK" && got == id {
+				if !accepted {
+					return errors.New("relay rejected the response")
+				}
+				return nil
+			}
+		}
+	}
+	finish := func(r rpcResponse) error {
+		if err := respond(r); err != nil {
+			return err
+		}
+		return awaitOK(lastSent)
 	}
 
 	if err := send([]any{"REQ", "s", gonostr.Filter{Kinds: []int{kindNostrConnect}, Tags: gonostr.TagMap{"p": {signerPK}}}}); err != nil {
@@ -255,10 +286,10 @@ func (s *Signer) Connect(ctx context.Context, uri string) error {
 		}
 		s.Request.Method, s.Request.Params = req.Method, req.Params
 		if req.Method != "sign_event" || len(req.Params) != 1 {
-			return respond(rpcResponse{ID: req.ID, Error: "unsupported"})
+			return finish(rpcResponse{ID: req.ID, Error: "unsupported"})
 		}
 		if s.Refuse != "" {
-			return respond(rpcResponse{ID: req.ID, Error: s.Refuse})
+			return finish(rpcResponse{ID: req.ID, Error: s.Refuse})
 		}
 		var tmpl gonostr.Event
 		if err := json.Unmarshal([]byte(req.Params[0]), &tmpl); err != nil {
@@ -271,6 +302,6 @@ func (s *Signer) Connect(ctx context.Context, uri string) error {
 			return err
 		}
 		signed, _ := json.Marshal(tmpl)
-		return respond(rpcResponse{ID: req.ID, Result: string(signed)})
+		return finish(rpcResponse{ID: req.ID, Result: string(signed)})
 	}
 }
