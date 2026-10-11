@@ -238,7 +238,6 @@ func FromEnv() (*Config, error) {
 
 // DefaultFallbackRelays are well-known relays that aggregate profile data
 var DefaultFallbackRelays = []string{
-	"wss://relay.nostr.band/",
 	"wss://nostr.wine/",
 	"wss://nos.lol/",
 	"wss://relay.primal.net/",

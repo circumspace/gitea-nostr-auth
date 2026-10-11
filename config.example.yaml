@@ -38,7 +38,6 @@ nostr:
   # Relays used to look up NIP-65 relay lists and kind-0 profiles.
   # Leave empty for the defaults below.
   fallback_relays:
-    - "wss://relay.nostr.band/"
     - "wss://nostr.wine/"
     - "wss://nos.lol/"
     - "wss://relay.primal.net/"

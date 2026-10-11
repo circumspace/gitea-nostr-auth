@@ -272,8 +272,8 @@ Kubernetes hints:
    after DNS resolution. Results are cached for 24 h, and failed lookups for
    5 minutes.
 
-Default fallback relays: `wss://relay.nostr.band/`, `wss://nostr.wine/`,
-`wss://nos.lol/`, `wss://relay.primal.net/`, `wss://purplepag.es/`.
+Default fallback relays: `wss://nostr.wine/`, `wss://nos.lol/`,
+`wss://relay.primal.net/`, `wss://purplepag.es/`.
 
 Residual risk: NIP-07 extensions and NIP-46 signers sign whatever a page asks for. A user who
 approves a kind-27235 "Sign in to … via …" signature on a hostile site lets
