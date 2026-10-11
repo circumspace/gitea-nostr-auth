@@ -13,6 +13,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   IMAGE: git.circum.space/circumspace/gitea-nostr-auth
@@ -43,7 +44,7 @@ jobs:
             v=${GITHUB_REF_NAME#v}
             echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a semver tag: $GITHUB_REF_NAME"; exit 1; }
             tags="$tags -t $IMAGE:$v -t $IMAGE:${v%.*} -t $IMAGE:${v%%.*}"
-          else
+          elif [ "$GITHUB_REF_NAME" = main ]; then
             tags="$tags -t $IMAGE:latest"
           fi
           echo "args=$tags" >> "$GITHUB_OUTPUT"
