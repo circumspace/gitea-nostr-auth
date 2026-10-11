@@ -1,92 +1,97 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
 )
 
+// UserInfoResponse is the /userinfo response. preferred_username, nickname
+// and email are derived from the public key only, so the relying party can
+// never be steered into matching an existing account by profile data.
 type UserInfoResponse struct {
 	Sub               string `json:"sub"`
 	Name              string `json:"name,omitempty"`
-	PreferredUsername string `json:"preferred_username"`
+	PreferredUsername string `json:"preferred_username,omitempty"`
+	Nickname          string `json:"nickname,omitempty"`
 	Email             string `json:"email,omitempty"`
-	EmailVerified     bool   `json:"email_verified,omitempty"`
+	EmailVerified     bool   `json:"email_verified"`
 	Picture           string `json:"picture,omitempty"`
-	Profile           string `json:"profile,omitempty"`
-	Website           string `json:"website,omitempty"`
-	Error             string `json:"error,omitempty"`
-	ErrorDesc         string `json:"error_description,omitempty"`
+	Npub              string `json:"npub,omitempty"`
 }
+
+type errorResponse struct {
+	Error     string `json:"error"`
+	ErrorDesc string `json:"error_description,omitempty"`
+}
+
+// profileLookupTimeout bounds how long /userinfo waits for relays.
+const profileLookupTimeout = 8 * time.Second
 
 func (h *Handler) UserInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	noStore(w)
 
-	// Extract Bearer token
-	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
+	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer`)
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(UserInfoResponse{
-			Error:     "invalid_token",
-			ErrorDesc: "missing or invalid Authorization header",
-		})
+		_ = json.NewEncoder(w).Encode(errorResponse{Error: "invalid_token", ErrorDesc: "missing or invalid Authorization header"})
 		return
 	}
 
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-
-	// Look up access token
-	accessToken, err := h.store.GetAccessToken(token)
+	accessToken, err := h.store.GetAccessToken(strings.TrimSpace(token))
 	if err != nil || accessToken == nil {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(UserInfoResponse{
-			Error:     "invalid_token",
-			ErrorDesc: "token is invalid or expired",
-		})
+		_ = json.NewEncoder(w).Encode(errorResponse{Error: "invalid_token", ErrorDesc: "token is invalid or expired"})
 		return
 	}
 
-	pubkey := accessToken.Pubkey
+	resp, err := h.userInfoFor(r.Context(), accessToken.Pubkey)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(errorResponse{Error: "server_error"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) userInfoFor(ctx context.Context, pubkey string) (*UserInfoResponse, error) {
+	username, err := nostr.Username(pubkey)
+	if err != nil {
+		return nil, err
+	}
+	email, err := nostr.PlaceholderEmail(pubkey, h.cfg.Nostr.EmailDomain)
+	if err != nil {
+		return nil, err
+	}
 	npub := nostr.PubkeyToNpub(pubkey)
-
-	// Fetch profile from relays (this also fetches relay list first)
-	log.Printf("Fetching profile for %s from relays...", nostr.TruncateNpub(npub))
-	profile := h.fetcher.FetchProfile(r.Context(), pubkey)
-
-	// Build response with profile data or fallbacks
-	response := UserInfoResponse{
-		Sub: pubkey,
+	resp := &UserInfoResponse{
+		Sub:               pubkey,
+		PreferredUsername: username,
+		Nickname:          username,
+		Email:             email,
+		EmailVerified:     false,
+		Npub:              npub,
+		Name:              nostr.TruncateNpub(npub),
 	}
 
-	if profile != nil {
-		log.Printf("Got profile for %s: name=%s, nip05=%s", nostr.TruncateNpub(npub), profile.Name, profile.Nip05)
-
-		// Use profile data
-		response.Name = profile.GetDisplayName()
-		response.PreferredUsername = profile.GetUsername()
-		response.Picture = profile.Picture
-		response.Website = profile.Website
-		response.Profile = profile.About
-
-		// Use NIP-05 as email if available (it's verified in the Nostr sense)
-		if profile.Nip05 != "" {
-			// NIP-05 format: name@domain.com or _@domain.com
-			response.Email = profile.Nip05
-			response.EmailVerified = false // We haven't verified it ourselves
-		} else {
-			response.Email = nostr.GeneratePlaceholderEmail(pubkey)
+	if h.fetcher != nil {
+		ctx, cancel := context.WithTimeout(ctx, profileLookupTimeout)
+		defer cancel()
+		if profile := h.fetcher.FetchProfile(ctx, pubkey); profile != nil {
+			if name := nostr.SanitizeDisplayName(profile.GetDisplayName()); name != "" {
+				resp.Name = name
+			}
+			if h.cfg.Nostr.PictureEnabled() {
+				resp.Picture = nostr.SafePictureURL(profile.Picture)
+			}
 		}
-	} else {
-		log.Printf("No profile found for %s, using defaults", nostr.TruncateNpub(npub))
-
-		// Fallback to generated values
-		response.PreferredUsername = nostr.GenerateUsername(pubkey)
-		response.Name = nostr.TruncateNpub(npub)
-		response.Email = nostr.GeneratePlaceholderEmail(pubkey)
 	}
-
-	json.NewEncoder(w).Encode(response)
+	return resp, nil
 }

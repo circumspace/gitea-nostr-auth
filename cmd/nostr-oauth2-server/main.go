@@ -20,14 +20,20 @@ func main() {
 	if err != nil {
 		// Try environment variables if config file not found
 		if os.IsNotExist(err) {
-			cfg = config.FromEnv()
+			if cfg, err = config.FromEnv(); err != nil {
+				log.Fatalf("invalid environment configuration: %v", err)
+			}
 		} else {
 			log.Fatalf("failed to load config: %v", err)
 		}
 	}
 
 	store := oauth2.NewMemoryStore()
-	fetcher := nostr.NewFetcher(cfg.Nostr.FallbackRelays)
+	fetcher := nostr.NewFetcher(nostr.Options{
+		FallbackRelays: cfg.Nostr.FallbackRelays,
+		MaxUserRelays:  cfg.Nostr.MaxUserRelays,
+		AllowPrivate:   cfg.Nostr.AllowPrivateRelays,
+	})
 	router := handler.NewRouter(cfg, store, fetcher)
 
 	addr := cfg.Server.Address()

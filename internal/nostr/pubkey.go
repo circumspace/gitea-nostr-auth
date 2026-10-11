@@ -2,19 +2,25 @@ package nostr
 
 import (
 	"fmt"
+	"regexp"
 
 	"github.com/nbd-wtf/go-nostr/nip19"
 )
 
-// PubkeyToNpub converts a hex public key to bech32 npub format
+var hexPubkeyRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// IsHexPubkey reports whether s is a 32-byte lowercase hex public key.
+func IsHexPubkey(s string) bool { return hexPubkeyRE.MatchString(s) }
+
+// PubkeyToNpub converts a hex public key to bech32 npub format.
+// It returns an empty string for invalid input.
 func PubkeyToNpub(hexPubkey string) string {
+	if !IsHexPubkey(hexPubkey) {
+		return ""
+	}
 	npub, err := nip19.EncodePublicKey(hexPubkey)
 	if err != nil {
-		// If encoding fails, return truncated hex
-		if len(hexPubkey) > 16 {
-			return hexPubkey[:16] + "..."
-		}
-		return hexPubkey
+		return ""
 	}
 	return npub
 }
@@ -38,21 +44,4 @@ func TruncateNpub(npub string) string {
 		return npub
 	}
 	return npub[:12] + "..." + npub[len(npub)-8:]
-}
-
-// GenerateUsername creates a username from a pubkey
-// Prefers NIP-05 identifier if available, otherwise uses npub prefix
-func GenerateUsername(hexPubkey string) string {
-	npub := PubkeyToNpub(hexPubkey)
-	// Use first 12 chars of npub (npub1 + 7 chars)
-	if len(npub) > 12 {
-		return npub[:12]
-	}
-	return npub
-}
-
-// GeneratePlaceholderEmail creates a placeholder email for Gitea
-func GeneratePlaceholderEmail(hexPubkey string) string {
-	username := GenerateUsername(hexPubkey)
-	return username + "@nostr.local"
 }

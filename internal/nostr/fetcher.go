@@ -3,180 +3,195 @@ package nostr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	gonostr "github.com/nbd-wtf/go-nostr"
 )
 
 const (
-	// FetchTimeout is how long to wait for relay responses
-	FetchTimeout = 10 * time.Second
-	// CacheTTL is how long to cache relay lists and profiles
+	// FetchTimeout bounds each phase (relay list, profile) of a lookup.
+	FetchTimeout = 5 * time.Second
+	// CacheTTL is how long to cache relay lists and profiles.
 	CacheTTL = 24 * time.Hour
+	// NegativeCacheTTL is how long to cache a failed lookup.
+	NegativeCacheTTL = 5 * time.Minute
+
+	maxCacheEntries     = 10000
+	maxConcurrentDials  = 32
+	maxMessageBytes     = 128 << 10
+	maxEventsPerRelay   = 10
+	maxProfileJSONBytes = 64 << 10
+	maxRelayTags        = 100
 )
 
-// Fetcher handles fetching relay lists and profiles from Nostr relays
+// Options configure a Fetcher.
+type Options struct {
+	FallbackRelays []string
+	// MaxUserRelays caps how many read relays from the NIP-65 list are used.
+	MaxUserRelays int
+	// AllowPrivate disables the non-public address guard (tests only).
+	AllowPrivate bool
+}
+
+// Fetcher fetches relay lists and profiles from Nostr relays. Outbound
+// connections go through a dialer that refuses non-public addresses, user
+// supplied relays must be wss:// and are capped in number, and every event
+// is checked for id, signature and filter match before use.
 type Fetcher struct {
 	fallbackRelays []string
-	relayCache     map[string]*relayListCacheEntry
-	profileCache   map[string]*profileCacheEntry
-	mu             sync.RWMutex
+	maxUserRelays  int
+	// userRelayFilter validates relay URLs from NIP-65 lists (replaceable in tests).
+	userRelayFilter func(string) string
+	httpClient      *http.Client
+	sem             chan struct{}
+	relayCache      *ttlCache[[]Nip65Relay]
+	profileCache    *ttlCache[*ProfileMetadata]
 }
 
-type relayListCacheEntry struct {
-	Relays    []Nip65Relay
-	FetchedAt time.Time
-}
-
-type profileCacheEntry struct {
-	Profile   *ProfileMetadata
-	FetchedAt time.Time
-}
-
-// NewFetcher creates a new Fetcher with the given fallback relays
-func NewFetcher(fallbackRelays []string) *Fetcher {
+// NewFetcher creates a new Fetcher.
+func NewFetcher(opts Options) *Fetcher {
+	dialer := &net.Dialer{Timeout: FetchTimeout, KeepAlive: 30 * time.Second}
+	if !opts.AllowPrivate {
+		dialer.Control = guardControl
+	}
+	transport := &http.Transport{
+		Proxy:                 nil, // never route through environment proxies: the guard must see the real peer
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   FetchTimeout,
+		ResponseHeaderTimeout: FetchTimeout,
+		MaxIdleConns:          0,
+		DisableKeepAlives:     true,
+	}
+	client := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	var fallback []string
+	for _, r := range opts.FallbackRelays {
+		if n := normalizeRelayURL(r, true); n != "" {
+			fallback = append(fallback, n)
+		} else {
+			log.Printf("ignoring invalid fallback relay %q", r)
+		}
+	}
 	return &Fetcher{
-		fallbackRelays: fallbackRelays,
-		relayCache:     make(map[string]*relayListCacheEntry),
-		profileCache:   make(map[string]*profileCacheEntry),
+		fallbackRelays:  fallback,
+		maxUserRelays:   opts.MaxUserRelays,
+		userRelayFilter: func(u string) string { return normalizeRelayURL(u, false) },
+		httpClient:      client,
+		sem:             make(chan struct{}, maxConcurrentDials),
+		relayCache:      newTTLCache[[]Nip65Relay](maxCacheEntries),
+		profileCache:    newTTLCache[*ProfileMetadata](maxCacheEntries),
 	}
 }
 
-// newPubkeyFilter builds a filter for a given kind and hex pubkey with a limit.
-func newPubkeyFilter(k int, pubkey string, limit int) *gonostr.Filter {
-	if !gonostr.IsValidPublicKey(pubkey) {
-		return nil
-	}
-	return &gonostr.Filter{
+func newPubkeyFilter(k int, pubkey string, limit int) gonostr.Filter {
+	return gonostr.Filter{
 		Kinds:   []int{k},
 		Authors: []string{pubkey},
 		Limit:   limit,
 	}
 }
 
-// FetchRelayList fetches a user's NIP-65 relay list (kind 10002)
+// FetchRelayList fetches a user's NIP-65 relay list (kind 10002).
 func (f *Fetcher) FetchRelayList(ctx context.Context, pubkey string) []Nip65Relay {
-	// Check cache first
-	f.mu.RLock()
-	if entry, ok := f.relayCache[pubkey]; ok {
-		if time.Since(entry.FetchedAt) < CacheTTL {
-			f.mu.RUnlock()
-			return entry.Relays
-		}
+	if !IsHexPubkey(pubkey) {
+		return nil
 	}
-	f.mu.RUnlock()
-
-	// Fetch from relays
-	relays := f.doFetchRelayList(ctx, pubkey)
-
-	// Cache result
-	f.mu.Lock()
-	f.relayCache[pubkey] = &relayListCacheEntry{
-		Relays:    relays,
-		FetchedAt: time.Now(),
+	if relays, ok := f.relayCache.Get(pubkey); ok {
+		return relays
 	}
-	f.mu.Unlock()
-
+	relays, found := f.doFetchRelayList(ctx, pubkey)
+	ttl := CacheTTL
+	if !found {
+		ttl = NegativeCacheTTL
+	}
+	f.relayCache.Set(pubkey, relays, ttl)
 	return relays
 }
 
-func (f *Fetcher) doFetchRelayList(ctx context.Context, pubkey string) []Nip65Relay {
+func (f *Fetcher) doFetchRelayList(ctx context.Context, pubkey string) ([]Nip65Relay, bool) {
 	ctx, cancel := context.WithTimeout(ctx, FetchTimeout)
 	defer cancel()
 
-	ff := newPubkeyFilter(10002, pubkey, 10)
-	if ff == nil {
-		return nil
+	latest := latestEvent(f.queryRelays(ctx, f.fallbackRelays, newPubkeyFilter(10002, pubkey, maxEventsPerRelay)))
+	if latest == nil {
+		return nil, false
 	}
 
-	events := f.queryRelays(ctx, f.fallbackRelays, ff)
-	if len(events) == 0 {
-		return nil
-	}
-
-	// Get the most recent event
-	var latest *gonostr.Event
-	for _, ev := range events {
-		if latest == nil || ev.CreatedAt > latest.CreatedAt {
-			latest = ev
-		}
-	}
-
-	// Parse relay tags
 	var relays []Nip65Relay
-	{
-		for _, ss := range latest.Tags {
-			if len(ss) >= 2 && ss[0] == "r" {
-				relay := Nip65Relay{
-					URL:   ss[1],
-					Read:  true,
-					Write: true,
-				}
-				if len(ss) >= 3 {
-					switch ss[2] {
-					case "read":
-						relay.Write = false
-					case "write":
-						relay.Read = false
-					}
-				}
-				relays = append(relays, relay)
+	for i, t := range latest.Tags {
+		if i >= maxRelayTags {
+			break
+		}
+		if len(t) < 2 || t[0] != "r" {
+			continue
+		}
+		u := f.userRelayFilter(t[1])
+		if u == "" {
+			continue
+		}
+		relay := Nip65Relay{URL: u, Read: true, Write: true}
+		if len(t) >= 3 {
+			switch t[2] {
+			case "read":
+				relay.Write = false
+			case "write":
+				relay.Read = false
 			}
 		}
+		relays = append(relays, relay)
 	}
-
-	return relays
+	return relays, true
 }
 
-// FetchProfile fetches a user's profile metadata (kind 0)
-// It first fetches the user's relay list, then queries those relays + fallbacks
+// FetchProfile fetches a user's profile metadata (kind 0). It first fetches
+// the user's relay list, then queries a capped number of the user's read
+// relays plus the fallback relays.
 func (f *Fetcher) FetchProfile(ctx context.Context, pubkey string) *ProfileMetadata {
-	// Check cache first
-	f.mu.RLock()
-	if entry, ok := f.profileCache[pubkey]; ok {
-		if time.Since(entry.FetchedAt) < CacheTTL {
-			f.mu.RUnlock()
-			return entry.Profile
-		}
+	if !IsHexPubkey(pubkey) {
+		return nil
 	}
-	f.mu.RUnlock()
+	if p, ok := f.profileCache.Get(pubkey); ok {
+		return p
+	}
 
-	// First, get the user's relay list
 	userRelays := f.FetchRelayList(ctx, pubkey)
 
-	// Build relay list: user's read relays + fallbacks
-	relayURLs := make([]string, 0, len(userRelays)+len(f.fallbackRelays))
+	relayURLs := make([]string, 0, f.maxUserRelays+len(f.fallbackRelays))
 	seen := make(map[string]bool)
-
-	// Add user's read relays first (more likely to have their profile)
+	added := 0
 	for _, r := range userRelays {
+		if added >= f.maxUserRelays {
+			break
+		}
 		if r.Read && !seen[r.URL] {
 			relayURLs = append(relayURLs, r.URL)
 			seen[r.URL] = true
+			added++
+		}
+	}
+	for _, u := range f.fallbackRelays {
+		if !seen[u] {
+			relayURLs = append(relayURLs, u)
+			seen[u] = true
 		}
 	}
 
-	// Add fallback relays
-	for _, url := range f.fallbackRelays {
-		if !seen[url] {
-			relayURLs = append(relayURLs, url)
-			seen[url] = true
-		}
-	}
-
-	// Fetch profile
 	profile := f.doFetchProfile(ctx, pubkey, relayURLs)
-
-	// Cache result (even if nil)
-	f.mu.Lock()
-	f.profileCache[pubkey] = &profileCacheEntry{
-		Profile:   profile,
-		FetchedAt: time.Now(),
+	ttl := CacheTTL
+	if profile == nil {
+		ttl = NegativeCacheTTL
 	}
-	f.mu.Unlock()
-
+	f.profileCache.Set(pubkey, profile, ttl)
 	return profile
 }
 
@@ -184,151 +199,149 @@ func (f *Fetcher) doFetchProfile(ctx context.Context, pubkey string, relayURLs [
 	ctx, cancel := context.WithTimeout(ctx, FetchTimeout)
 	defer cancel()
 
-	ff := newPubkeyFilter(0, pubkey, 10)
-	if ff == nil {
+	latest := latestEvent(f.queryRelays(ctx, relayURLs, newPubkeyFilter(0, pubkey, maxEventsPerRelay)))
+	if latest == nil {
 		return nil
 	}
+	return parseProfile(pubkey, latest.Content)
+}
 
-	events := f.queryRelays(ctx, relayURLs, ff)
-	if len(events) == 0 {
+func parseProfile(pubkey, content string) *ProfileMetadata {
+	if len(content) > maxProfileJSONBytes {
 		return nil
 	}
+	var c map[string]any
+	if err := json.Unmarshal([]byte(content), &c); err != nil {
+		log.Printf("failed to parse profile content for %s: %v", TruncateNpub(PubkeyToNpub(pubkey)), err)
+		return nil
+	}
+	str := func(k string) string {
+		v, _ := c[k].(string)
+		return v
+	}
+	p := &ProfileMetadata{
+		Pubkey:      pubkey,
+		Name:        SanitizeDisplayName(str("name")),
+		DisplayName: SanitizeDisplayName(str("display_name")),
+		Picture:     SafePictureURL(str("picture")),
+		Nip05:       SanitizeDisplayName(str("nip05")),
+	}
+	if p.DisplayName == "" {
+		p.DisplayName = SanitizeDisplayName(str("displayName"))
+	}
+	return p
+}
 
-	// Get the most recent event
+func latestEvent(events []*gonostr.Event) *gonostr.Event {
 	var latest *gonostr.Event
 	for _, ev := range events {
 		if latest == nil || ev.CreatedAt > latest.CreatedAt {
 			latest = ev
 		}
 	}
-
-	// Parse profile content
-	var content map[string]interface{}
-	if err := json.Unmarshal([]byte(latest.Content), &content); err != nil {
-		log.Printf("Failed to parse profile content for %s: %v", pubkey, err)
-		return nil
-	}
-
-	profile := &ProfileMetadata{
-		Pubkey: pubkey,
-	}
-
-	if v, ok := content["name"].(string); ok {
-		profile.Name = v
-	}
-	if v, ok := content["display_name"].(string); ok {
-		profile.DisplayName = v
-	}
-	if v, ok := content["displayName"].(string); ok && profile.DisplayName == "" {
-		profile.DisplayName = v
-	}
-	if v, ok := content["picture"].(string); ok {
-		profile.Picture = v
-	}
-	if v, ok := content["banner"].(string); ok {
-		profile.Banner = v
-	}
-	if v, ok := content["about"].(string); ok {
-		profile.About = v
-	}
-	if v, ok := content["website"].(string); ok {
-		profile.Website = v
-	}
-	if v, ok := content["nip05"].(string); ok {
-		profile.Nip05 = v
-	}
-	if v, ok := content["lud06"].(string); ok {
-		profile.Lud06 = v
-	}
-	if v, ok := content["lud16"].(string); ok {
-		profile.Lud16 = v
-	}
-
-	return profile
+	return latest
 }
 
-// queryRelays queries multiple relays and collects events
-func (f *Fetcher) queryRelays(ctx context.Context, relayURLs []string, ff *gonostr.Filter) []*gonostr.Event {
+// queryRelays queries multiple relays concurrently and collects verified
+// events matching ff.
+func (f *Fetcher) queryRelays(ctx context.Context, relayURLs []string, ff gonostr.Filter) []*gonostr.Event {
 	var (
 		events   []*gonostr.Event
 		eventsMu sync.Mutex
 		wg       sync.WaitGroup
 	)
-
-	// Query each relay concurrently
-	for _, url := range relayURLs {
+	for _, u := range relayURLs {
 		wg.Add(1)
 		go func(relayURL string) {
 			defer wg.Done()
-
-			relay, err := gonostr.RelayConnect(ctx, relayURL)
-			if err != nil {
-				// Silently skip failed relays
+			select {
+			case f.sem <- struct{}{}:
+				defer func() { <-f.sem }()
+			case <-ctx.Done():
 				return
 			}
-			defer relay.Close()
-
-			sub, err := relay.Subscribe(ctx, gonostr.Filters{*ff})
-			if err != nil {
-				return
+			evs, err := f.queryRelay(ctx, relayURL, ff)
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+				log.Printf("relay %s: %v", relayURL, err)
 			}
-			defer sub.Unsub()
-
-			for {
-				select {
-				case ev, ok := <-sub.Events:
-					if !ok {
-						return
-					}
-					eventsMu.Lock()
-					events = append(events, ev)
-					eventsMu.Unlock()
-				case <-sub.EndOfStoredEvents:
-					return
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(url)
+			eventsMu.Lock()
+			events = append(events, evs...)
+			eventsMu.Unlock()
+		}(u)
 	}
-
-	// Wait for all queries to complete or timeout
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
-
+	wg.Wait()
 	return events
 }
 
-// GetCachedProfile returns a cached profile if available and not expired
-func (f *Fetcher) GetCachedProfile(pubkey string) *ProfileMetadata {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+const subID = "p"
 
-	if entry, ok := f.profileCache[pubkey]; ok {
-		if time.Since(entry.FetchedAt) < CacheTTL {
-			return entry.Profile
+func (f *Fetcher) queryRelay(ctx context.Context, relayURL string, ff gonostr.Filter) ([]*gonostr.Event, error) {
+	conn, resp, err := websocket.Dial(ctx, relayURL, &websocket.DialOptions{
+		HTTPClient: f.httpClient,
+		HTTPHeader: http.Header{"User-Agent": {"gitea-nostr-auth"}},
+	})
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(maxMessageBytes)
+
+	req, err := gonostr.ReqEnvelope{SubscriptionID: subID, Filters: gonostr.Filters{ff}}.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.Write(ctx, websocket.MessageText, req); err != nil {
+		return nil, err
+	}
+
+	var events []*gonostr.Event
+	for len(events) < maxEventsPerRelay {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			return events, err
+		}
+		var msg []json.RawMessage
+		if err := json.Unmarshal(data, &msg); err != nil || len(msg) < 2 {
+			continue
+		}
+		var label, sid string
+		if json.Unmarshal(msg[0], &label) != nil {
+			continue
+		}
+		_ = json.Unmarshal(msg[1], &sid)
+		switch label {
+		case "EVENT":
+			if sid != subID || len(msg) < 3 {
+				continue
+			}
+			var ev gonostr.Event
+			if err := json.Unmarshal(msg[2], &ev); err != nil {
+				continue
+			}
+			if ValidEvent(&ev) && ff.Matches(&ev) {
+				events = append(events, &ev)
+			}
+		case "EOSE", "CLOSED":
+			if sid == subID {
+				closeMsg, _ := json.Marshal([]string{"CLOSE", subID})
+				_ = conn.Write(ctx, websocket.MessageText, closeMsg)
+				conn.Close(websocket.StatusNormalClosure, "")
+				return events, nil
+			}
 		}
 	}
-	return nil
+	return events, nil
 }
 
-// GetCachedRelayList returns a cached relay list if available and not expired
-func (f *Fetcher) GetCachedRelayList(pubkey string) []Nip65Relay {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	if entry, ok := f.relayCache[pubkey]; ok {
-		if time.Since(entry.FetchedAt) < CacheTTL {
-			return entry.Relays
-		}
+// ValidEvent reports whether the event id is the hash of its canonical
+// serialisation and the signature over that hash is valid for its pubkey.
+func ValidEvent(ev *gonostr.Event) bool {
+	if !IsHexPubkey(ev.PubKey) || !ev.CheckID() {
+		return false
 	}
-	return nil
+	ok, err := ev.CheckSignature()
+	return err == nil && ok
 }
