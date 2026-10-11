@@ -1,12 +1,16 @@
 # gitea-nostr-auth
 
 An OAuth2/OpenID Connect provider that lets people sign in to **Gitea** (and
-Forgejo) with their Nostr identity, using a NIP-07 browser extension (Alby,
-nos2x, ...) to sign a login challenge.
+Forgejo) with their Nostr identity. Users sign a login challenge with a
+NIP-07 browser extension (Alby, nos2x, ...) or with a NIP-46 remote signer
+app such as Amber on Android.
 
 - **NIP-07 login**: the user signs a NIP-98 style kind-27235 event that is
   bound to this server's `/verify` URL, a single-use challenge, and the browser
   that started the flow.
+- **NIP-46 login (Amber)**: the login page shows a `nostrconnect://` link
+  and QR code. The signer app is asked to sign the same event, which goes
+  through the same verification as the extension path.
 - **Standard OIDC provider**: discovery, RS256-signed ID tokens, JWKS,
   userinfo, PKCE (S256), `nonce`.
 - **Auto-registration in Gitea**: identity claims are derived only from the
@@ -171,6 +175,9 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 | `nostr.email_domain` | `NOSTR_EMAIL_DOMAIN` | `nostr.invalid` |
 | `nostr.expose_picture` | `NOSTR_EXPOSE_PICTURE` | `true` |
 | `nostr.allow_private_relays` (testing only) | `NOSTR_ALLOW_PRIVATE_RELAYS` | `false` |
+| `nostr.nip46.relay` (empty: NIP-46 login off) | `NOSTR_NIP46_RELAY` | |
+| `nostr.nip46.timeout` | `NOSTR_NIP46_TIMEOUT` | `2m` |
+| `nostr.nip46.allow_private_relay` | `NOSTR_NIP46_ALLOW_PRIVATE_RELAY` | `false` |
 
 **Signing key.** Without `signing_key_file`, a fresh RSA key is generated on
 every start. That is fine for Gitea, which consumes ID tokens immediately.
@@ -179,7 +186,21 @@ Mount a persistent key if other relying parties cache the JWKS:
 To rotate, replace the file and restart. Tokens are short-lived, so no overlap
 period is needed for Gitea.
 
-**State.** Challenges, codes and tokens live in memory. Run a single replica,
+**NIP-46 relay.** Every remote signer login uses this one relay. It must:
+
+- be reachable from this server and from the users' phones, so for phones
+  outside the tailnet it must be public;
+- accept kind-24133 events from any public key, because each login uses a
+  fresh client key (a relay with a web-of-trust or allowlist write policy
+  rejects them);
+- not require NIP-42 authentication.
+
+The connection goes through the same address guard as profile lookups.
+`allow_private_relay` lifts the guard for this relay only, for example for a
+relay inside the cluster. A Kubernetes network policy must also allow egress
+to it.
+
+**State.** Challenges, codes, tokens and NIP-46 sessions live in memory. Run a single replica,
 or use sticky sessions.
 
 ## Build and run
@@ -228,6 +249,18 @@ Kubernetes hints:
 
    It then consumes the challenge atomically and returns a redirect to Gitea
    with a 2-minute single-use code.
+
+   With a NIP-46 signer instead, the page calls `/nip46/start`. The server
+   checks that the challenge was issued to this browser, creates a client
+   keypair and a 128-bit one-time secret, subscribes on the configured relay
+   and returns `nostrconnect://<client pubkey>?relay=…&secret=…&perms=sign_event:27235`
+   as a link and QR code. The first signer that answers with the secret
+   becomes the session's signer. The server sends it one `sign_event` request
+   for the login event (NIP-44 encrypted) and accepts the answer only from
+   that signer. The page long-polls `/nip46/wait`, which requires the binding
+   cookie. When the signed event arrives, `/nip46/wait` runs the same checks
+   as `/verify` (step 3). A session ends after `nip46.timeout` or when the
+   challenge expires, whichever comes first.
 4. Gitea redeems the code at `/token`, authenticating with
    `client_secret_basic` or `client_secret_post`. It receives an RS256 ID
    token and a 10-minute access token, then calls `/userinfo`.
@@ -242,10 +275,12 @@ Kubernetes hints:
 Default fallback relays: `wss://relay.nostr.band/`, `wss://nostr.wine/`,
 `wss://nos.lol/`, `wss://relay.primal.net/`, `wss://purplepag.es/`.
 
-Residual risk: NIP-07 extensions sign whatever a page asks for. A user who
+Residual risk: NIP-07 extensions and NIP-46 signers sign whatever a page asks for. A user who
 approves a kind-27235 "Sign in to … via …" signature on a hostile site lets
 that site log in as them. The statement names both hosts so the prompt makes
-this visible. Only approve it on the auth server's own page.
+this visible. Only approve it on the auth server's own page. Anyone who sees
+a NIP-46 QR code can answer it first. They can then make that browser sign
+in as their own Nostr identity, but not as yours.
 
 ## API endpoints
 
@@ -255,6 +290,8 @@ this visible. Only approve it on the auth server's own page.
 | `GET /.well-known/jwks.json` | public signing key |
 | `GET /authorize` | authorization endpoint (login page) |
 | `POST /verify` | verifies the signed Nostr event (called by the login page) |
+| `POST /nip46/start` | starts a remote signer login (only with `nostr.nip46.relay`) |
+| `POST /nip46/wait` | long-polls a remote signer login and completes it |
 | `POST /token` | code exchange |
 | `GET/POST /userinfo` | user claims |
 | `GET /healthz` | liveness |

@@ -52,3 +52,14 @@ nostr:
   # Allow relay connections to private/loopback/tailnet addresses.
   # Testing only: this disables the SSRF guard.
   allow_private_relays: false
+
+  # Login with a NIP-46 remote signer (Amber on Android). Off while relay is
+  # empty. The relay must be reachable from this server and from the users'
+  # phones, accept kind 24133 from any pubkey and not require NIP-42 auth.
+  nip46:
+    relay: ""
+    # How long one remote signer login may take (30s - 10m). The challenge
+    # expiry (challenge_ttl) also applies.
+    timeout: 2m
+    # Allow the relay to resolve to a private, loopback or tailnet address.
+    allow_private_relay: false

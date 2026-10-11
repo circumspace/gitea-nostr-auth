@@ -551,6 +551,8 @@ A later move to `fiatjaf.com/nostr` should be mechanical.
 
 ### Tool results after changes
 
+Results at `956a207`:
+
 - `go vet ./...`: clean.
 - `staticcheck ./...` (2026.2.1): clean.
 - `govulncheck ./...` (go1.27.2): **No vulnerabilities found.**
@@ -567,3 +569,133 @@ A later move to `fiatjaf.com/nostr` should be mechanical.
   - no CORS, security headers, body limit;
   - SSRF guard, relay URL filtering and capping, event verification from
     relays, config validation.
+
+Results at `1c37374` (after NIP-46):
+
+- `go vet ./...`: clean.
+- `go test -race ./...`: pass, including the NIP-46 tests listed below.
+- `govulncheck ./...` (go1.27.2): no reachable vulnerabilities. One
+  module-level advisory, GO-2026-5932, covers `golang.org/x/crypto/openpgp`.
+  That package is deprecated and has no fix. This project does not import
+  it; `x/crypto` is only used by go-nostr's NIP-44 code.
+- `staticcheck` v0.8.1 could not run: it fails to read go1.27.2 export data
+  on this machine, also on the already reviewed commit `235be6e`. Run it
+  again once a release supports go1.27.
+
+## NIP-46 remote signer login (commit `1c37374`)
+
+Users without a NIP-07 extension, typically on Android with Amber, can sign
+the login event with a NIP-46 ("Nostr Connect") remote signer. The feature is
+off unless `nostr.nip46.relay` is set.
+
+Flow:
+
+1. The login page posts its challenge to `/nip46/start`.
+2. The server checks that the challenge exists and that the request carries
+   the browser binding cookie it was issued to.
+3. It creates a session with a fresh secp256k1 client keypair and a 128-bit
+   secret, and subscribes on the configured relay for kind 24133 addressed
+   to the client key.
+4. The page shows `nostrconnect://<client pubkey>?relay=…&secret=…&perms=sign_event:27235&name=…&url=…`
+   as a link and a QR code.
+5. The first signer that sends a response whose `result` equals the secret
+   becomes the session's signer. The server sends it one NIP-44 encrypted
+   `sign_event` request for the login event: kind 27235, the `u`, `method`
+   and `challenge` tags, and the sign-in statement.
+6. The page long-polls `/nip46/wait` with the same cookie. When the signer's
+   response arrives, `/nip46/wait` hands the signed event to `completeLogin`,
+   the function `/verify` uses. The identity is the signed event's `pubkey`,
+   which can differ from the remote signer's own key.
+
+| Threat | Handling | Status |
+|--------|----------|--------|
+| Another signer answers the connect request first | Only a response carrying the 128-bit secret (constant-time compare) sets the session's signer. After that, only events from that signer with the matching request id count. Test: `TestImpostorWithoutSecretCannotTakeOver`. | Fixed by design |
+| Someone who sees the QR code (screen share, shoulder surfing) answers first | They can make that browser sign in as their own Nostr identity (login CSRF). They cannot sign in as the victim, because they do not have the victim's key. The page tells users not to show the code to anyone else. | Residual, accepted (N-2) |
+| A third party starts or polls a session for someone else's challenge | `/nip46/start` and `/nip46/wait` require the challenge's binding cookie, and `completeLogin` checks it again. A second browser cannot attach to a challenge that already has a session (`ErrInUse`). Test: `TestRemoteSignerBindsBrowser`. | Fixed |
+| The signed event differs from what `/verify` accepts | Same code path. Tests confirm that a wrong statement, wrong `u` tag, foreign challenge, wrong kind and old timestamp are each rejected with the `/verify` error: `TestRemoteSignerEventVerified`. | Fixed |
+| Replay of the signed event or the session | The challenge is consumed atomically. The session is removed once its result has been read. After a NIP-46 login, `/verify` rejects the same challenge. Test: `TestRemoteSignerFullFlow`. | Fixed |
+| Signer granted more than needed | `perms=sign_event:27235`. The server sends exactly one request, `sign_event`. It never asks for `get_public_key`, encryption or other kinds. | Fixed |
+| Session outlives the challenge | Deadline is `min(nip46.timeout, challenge expiry)`, default 2 min. `checkEvent` also bounds `created_at`. | Fixed |
+| SSRF via the relay | The relay comes only from operator config; relay hints from signers are ignored. The dial goes through the same non-public address guard as profile lookups, unless `nip46.allow_private_relay` is set. Test: `TestRelayAddressGuard`. | Fixed |
+| Malicious or compromised relay | It can drop or delay messages (denial of service) and sees which client key talks to which signer key. It cannot forge messages: every event needs a valid id and signature, kind 24133, a `p` tag for the client key, and content that decrypts under the session key. | Residual: availability and metadata only |
+| Encryption | Requests use NIP-44. Responses may be NIP-44, or NIP-04 for older signers. NIP-04 has no MAC, but the outer event signature authenticates the response. A leaked response is useless without the browser binding cookie. | Accepted |
+| Resource exhaustion | Each session holds one websocket and goroutine until its deadline. Limits: 64 sessions in total, one per challenge, 200 relay events and 64 KiB per message per session. Anyone who can load `/authorize` can still fill the 64 slots and block NIP-46 logins for up to two minutes at a time; NIP-07 logins are unaffected. | Residual (N-1): rate-limit `/nip46/start` at the ingress |
+| Secrets in logs | The `nostrconnect://` URI and the secret are never logged; the access log has paths only. Signer error text is cut to 200 characters with control characters removed, and the page renders it with `textContent`. | Fixed |
+| CSP | `img-src` gains `data:` for the QR PNG. Images cannot run script. | Accepted |
+| Client keys | Generated per session with `crypto/rand`, kept in memory only, and discarded with the session. | Fixed |
+
+New findings:
+
+- **N-1 (Medium, open):** NIP-46 session slots can be exhausted, as described
+  in the table. While Gitea is tailnet-only, only tailnet members can do this.
+  Before exposing the service publicly, add an ingress rate limit for
+  `/authorize` and `/nip46/start`.
+- **N-2 (Low, accepted):** a QR code seen by someone else enables login CSRF
+  into the observer's own identity, as described in the table. This is
+  inherent to client-initiated NIP-46. The alternative, a `bunker://` URL
+  typed by the user, has the same property in reverse.
+
+New dependencies:
+
+- `rsc.io/qr` v0.2.0: a QR encoder with no dependencies. It is old but small,
+  and its only input is the server-generated URI.
+- `golang.org/x/crypto` v0.58.0: needed by go-nostr's `nip44` package.
+
+Relay choice: the relay must be reachable from the users' phones, accept
+kind 24133 from any public key, and not require NIP-42 authentication. The
+fresh client key of each login has no web of trust. A relay with a
+web-of-trust or allowlist write policy that covers kind 24133 will therefore
+reject the server's request, and the login times out.
+
+## Gitea integration check (live configuration)
+
+Checked against `kubernetes/apps/gitea/release.yaml` and
+`kubernetes/apps/nostr-auth/` in the infrastructure repository at `497b893`.
+
+| Setting | Live value | Required | Result |
+|---------|-----------|----------|--------|
+| `[oauth2_client] ACCOUNT_LINKING` | `login` | never `auto` | OK |
+| `[oauth2_client] ENABLE_AUTO_REGISTRATION` | `true` | `true` | OK |
+| `[oauth2_client] USERNAME` | `nickname` | `nickname` or `preferred_username` | OK |
+| `[oauth2_client] REGISTER_EMAIL_CONFIRM` | `false` | `false` | OK |
+| `[oauth2_client] UPDATE_AVATAR` | `false` | `false` recommended | OK |
+| `[oauth2_client] OPENID_CONNECT_SCOPES` | `openid profile email` | includes `openid` | OK |
+| `[service] DISABLE_REGISTRATION` / `ALLOW_ONLY_EXTERNAL_REGISTRATION` | `false` / `true` | as live | OK |
+| `[openid] ENABLE_OPENID_SIGNIN` / `SIGNUP` | `false` | unrelated, off | OK |
+| nostr-auth `redirect_uris` | `https://git.circum.space/user/oauth2/nostr/callback` | `<ROOT_URL>user/oauth2/nostr/callback` | OK |
+| nostr-auth `nostr.nip46` | not set | set to enable NIP-46 | NIP-46 off |
+
+A Nostr login can never be linked to an existing account by email:
+
+- Gitea links automatically only with `ACCOUNT_LINKING=auto`. With `login`, a
+  username or email conflict shows the link page, which requires the existing
+  account's password.
+- The email claim is `<full npub>@nostr.invalid`, derived from the verified
+  public key. No attacker can choose it, and no existing account has it (the
+  admin uses `gitea-admin@circum.space`).
+- The username is a 100-bit npub prefix, which cannot be ground to match an
+  existing name.
+
+Not checked: the `nostr` authentication source itself lives in Gitea's
+database (it is added with the admin CLI). Its fields, such as the discovery
+URL, scopes and "skip local 2FA", need an admin login to inspect.
+
+## Flag: Gitea admin password in Git history (not fixed here)
+
+Commit `390719e` of `github.com/circumspace/infrastructure` adds
+`kubernetes/apps/gitea/helm.yaml` with a plaintext admin user (`gitea`) and
+password. Later commits up to `b7995b3` keep the file. It remains in the
+history of every branch based on those commits.
+
+The live deployment (`a8424b3`) takes the admin credentials from the SOPS
+Secret `gitea-admin` with `passwordMode: keepUpdated`. The runbook says the
+old password is not reused. This review could not confirm that, because the
+SOPS key is not available here.
+
+To do:
+
+- Confirm that the SOPS password differs from the one in `390719e`, and that
+  no live account uses the old username and password.
+- Treat the old password as public if that repository is or has ever been
+  public, and never reuse it.
+- Rotate the admin password through the SOPS Secret if there is any doubt.
