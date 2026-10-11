@@ -131,3 +131,18 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 		t.Fatalf("expected unknown field error, got %v", err)
 	}
 }
+
+func TestExampleConfigParsesAndRejectsPlaceholder(t *testing.T) {
+	c, err := Load("../../config.example.yaml")
+	if err != nil {
+		t.Fatalf("example config does not parse: %v", err)
+	}
+	err = c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "example client_secret") {
+		t.Fatalf("expected placeholder secret rejection only, got %v", err)
+	}
+	c.OAuth2.Clients[0].ClientSecret = goodSecret
+	if err := c.Validate(); err != nil {
+		t.Fatalf("example config with real secret invalid: %v", err)
+	}
+}

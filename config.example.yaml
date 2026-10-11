@@ -1,33 +1,54 @@
-# Nostr OAuth2 Server Configuration
+# gitea-nostr-auth configuration example.
+# Copy to config.yaml (or mount at /etc/nostr-auth/config.yaml) and adjust.
+# The server refuses to start while the placeholder secret below is in use.
 
 server:
-  # Port to listen on
-  port: 8080
-  # Host to bind to (empty or 0.0.0.0 for all interfaces)
+  # Bind address and port.
   host: ""
-  # Public base URL (used for generating redirect URLs)
-  base_url: "http://localhost:8080"
+  port: 8080
+  # Public base URL; becomes the OIDC issuer. Required. Use https.
+  # Must be reachable from browsers AND from the Gitea server (back channel).
+  base_url: "https://nostr-auth.example.com"
 
 oauth2:
   clients:
-    # Gitea client configuration
     - client_id: "gitea"
-      # Generate a secure secret: openssl rand -hex 32
+      # Generate with: openssl rand -hex 32  (at least 32 characters)
       client_secret: "change-me-to-a-secure-secret"
+      # Or read it from a file (e.g. a mounted Kubernetes secret):
+      # client_secret_file: "/etc/nostr-auth/secret/client_secret"
       redirect_uris:
-        - "http://localhost:3000/user/oauth2/nostr/callback"
-        # Add your production Gitea URL here
-        # - "https://gitea.example.com/user/oauth2/nostr/callback"
+        # <Gitea ROOT_URL>user/oauth2/<auth source name>/callback (exact match)
+        - "https://git.example.com/user/oauth2/nostr/callback"
+      # Reject authorization requests without PKCE (S256). Gitea's OpenID
+      # Connect source does not send PKCE, so leave this false for Gitea.
+      require_pkce: false
+
+  # RSA private key (PEM, PKCS#1 or PKCS#8, >= 2048 bits) for ID tokens.
+  # Empty: an ephemeral key is generated at each start (fine for Gitea).
+  # signing_key_file: "/etc/nostr-auth/secret/signing.pem"
+
+  # code_ttl: 2m          # max 10m
+  # access_token_ttl: 10m # max 24h
+  # id_token_ttl: 5m      # max 1h
 
 nostr:
-  # How long a challenge is valid
-  challenge_ttl: 60s
-  # Fallback relays for fetching relay lists and profiles
-  # These are used when looking up NIP-65 relay lists and kind 0 profiles
-  # Leave empty to use defaults: relay.nostr.band, nostr.wine, nos.lol, relay.primal.net, purplepag.es
+  # How long a login challenge is valid (10s - 10m).
+  challenge_ttl: 2m
+  # Relays used to look up NIP-65 relay lists and kind-0 profiles.
+  # Leave empty for the defaults below.
   fallback_relays:
     - "wss://relay.nostr.band/"
     - "wss://nostr.wine/"
     - "wss://nos.lol/"
     - "wss://relay.primal.net/"
     - "wss://purplepag.es/"
+  # How many of a user's own (wss://) read relays to query.
+  max_user_relays: 5
+  # Domain of the placeholder email <npub>@<domain>. Must never receive mail.
+  email_domain: "nostr.invalid"
+  # Return the kind-0 picture (https only) as the "picture" claim.
+  expose_picture: true
+  # Allow relay connections to private/loopback/tailnet addresses.
+  # Testing only: this disables the SSRF guard.
+  allow_private_relays: false

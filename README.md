@@ -1,134 +1,265 @@
 # gitea-nostr-auth
 
-An OAuth2/OIDC provider that enables Nostr NIP-07 browser extension authentication for Gitea. Allows users to sign in to Gitea using their Nostr identity.
+An OAuth2/OpenID Connect provider that lets people sign in to **Gitea** (and
+Forgejo) with their Nostr identity, using a NIP-07 browser extension (Alby,
+nos2x, ...) to sign a login challenge.
 
-## Features
+- **NIP-07 login**: the user signs a NIP-98 style kind-27235 event that is
+  bound to this server's `/verify` URL, a single-use challenge, and the browser
+  that started the flow.
+- **Standard OIDC provider**: discovery, RS256-signed ID tokens, JWKS,
+  userinfo, PKCE (S256), `nonce`.
+- **Auto-registration in Gitea**: identity claims are derived only from the
+  public key, so they are deterministic and cannot collide with existing
+  accounts.
+- **Profile display data**: name and avatar come from the user's kind-0
+  profile, found through their NIP-65 relay list. Relay fetching is guarded
+  against SSRF and results are cached.
 
-- **NIP-07 Authentication**: Uses browser extensions (Alby, nos2x, etc.) for signing
-- **OAuth2/OIDC Compatible**: Works as a standard OpenID Connect provider for Gitea
-- **Auto-Registration**: Automatically creates Gitea accounts for new Nostr users
-- **Profile Fetching**: Fetches user profiles (name, picture, NIP-05) from Nostr relays
-- **Smart Relay Discovery**: First fetches user's NIP-65 relay list, then queries those relays for profile
-- **Caching**: 24-hour cache for relay lists and profiles to minimize relay queries
+See [SECURITY-REVIEW.md](SECURITY-REVIEW.md) for the security review of the
+upstream code and the status of each finding.
 
-## Quick Start
+## Identity mapping
 
-### 1. Build
+| Claim | Value | Source |
+|-------|-------|--------|
+| `sub` | hex public key | signed login event |
+| `preferred_username`, `nickname` | `npub1` + next 20 characters (25 characters, 100 bits), for example `npub1sg6plzptd64u62a878hep` | public key |
+| `email` | `<full npub>@nostr.invalid` | public key |
+| `email_verified` | always `false` | |
+| `name` | kind-0 `display_name` or `name` (sanitised, max 64 characters), else a shortened npub | profile, display only |
+| `picture` | kind-0 `picture`, only for `https://` URLs with a DNS host name | profile, display only |
 
-```bash
-go build ./cmd/nostr-oauth2-server
-```
+Profile fields such as `name` and `nip05` can be set by anyone to anything.
+They are never used as the username or the email. Otherwise an attacker could
+publish `{"name":"admin"}` or `{"nip05":"you@your-domain"}` and get linked to
+an existing account (see C-2 in the security review). `nostr.invalid` uses a
+reserved TLD (RFC 6761) and never receives mail.
 
-### 2. Configure
+## Configure Gitea (current release, v28)
 
-Copy `config.example.yaml` to `config.yaml` and update:
+Gitea's "OpenID Connect" authentication source uses goth's `openidConnect`
+provider. It reads the following claims:
+
+- `sub` becomes the external user id. The account link is keyed on it.
+- `nickname`, then `preferred_username`, becomes the nickname, which is the
+  default username source.
+- `email`, `name` (full name) and `picture` (avatar) are also read.
+
+Claims from `/userinfo` override those in the ID token. Gitea does not check
+`email_verified`.
+
+### 1. Register the client in this server
+
+Generate a secret: `openssl rand -hex 32`. The redirect URI is
+`<Gitea ROOT_URL>user/oauth2/<auth source name>/callback`. The source name is
+case-sensitive, so use `nostr`.
 
 ```yaml
-server:
-  port: 8080
-  base_url: "https://nostr-auth.example.com"
-
 oauth2:
   clients:
     - client_id: "gitea"
-      client_secret: "your-secure-secret"  # Generate with: openssl rand -hex 32
+      client_secret_file: "/etc/nostr-auth/secret/client_secret"
       redirect_uris:
-        - "https://gitea.example.com/user/oauth2/nostr/callback"
+        - "https://git.circum.space/user/oauth2/nostr/callback"
 ```
 
-### 3. Run
+### 2. Add the authentication source
 
-```bash
-./nostr-oauth2-server -config config.yaml
-```
+Admin UI path: *Site Administration → Identity & Access → Authentication
+Sources → Add*. Use these values:
 
-Or with environment variables:
+| Field | Value |
+|-------|-------|
+| Authentication type | OAuth2 |
+| Authentication name | `nostr` (must match the redirect URI) |
+| OAuth2 provider | OpenID Connect |
+| Client ID (Key) | `gitea` |
+| Client Secret | the secret from step 1 |
+| OpenID Connect Auto Discovery URL | `https://<auth host>/.well-known/openid-configuration` |
+| Additional scopes | `profile email` (`openid` is always added) |
+| Skip local 2FA | off |
+| Required claim name / Claim name providing group names / admin / restricted group | leave empty (this server issues no group claims) |
+| Full name claim name, SSH public key claim name | leave empty |
 
-```bash
-PORT=8080 \
-BASE_URL=https://nostr-auth.example.com \
-OAUTH2_CLIENT_ID=gitea \
-OAUTH2_CLIENT_SECRET=your-secure-secret \
-OAUTH2_REDIRECT_URIS=https://gitea.example.com/user/oauth2/nostr/callback \
-./nostr-oauth2-server
-```
-
-### 4. Configure Gitea
-
-Add the OAuth2 authentication source:
+The same setup from the CLI:
 
 ```bash
 gitea admin auth add-oauth \
-  --name "Nostr" \
+  --name nostr \
   --provider openidConnect \
-  --key "gitea" \
-  --secret "your-secure-secret" \
-  --auto-discover-url "https://nostr-auth.example.com/.well-known/openid-configuration"
+  --key gitea \
+  --secret "$CLIENT_SECRET" \
+  --auto-discover-url "https://<auth host>/.well-known/openid-configuration" \
+  --scopes "openid profile email"
 ```
 
-Enable auto-registration in Gitea's `app.ini`:
+### 3. `app.ini`
 
 ```ini
+[oauth2_client]
+; Create the account on first Nostr login. Without this, Gitea shows a
+; "link account / register" page.
+ENABLE_AUTO_REGISTRATION = true
+; The username comes from the nickname / preferred_username claim, which this
+; server sets to the deterministic npub prefix. `preferred_username` also works.
+USERNAME = nickname
+; NEVER set this to `auto`. With auto, Gitea links a new external login to an
+; existing local account that has the same username or primary email.
+; `login` (the default) asks for the existing account's password instead;
+; `disabled` shows an error.
+ACCOUNT_LINKING = login
+; Placeholder emails cannot receive mail, so never require confirmation for
+; OAuth2 sign-ups.
+REGISTER_EMAIL_CONFIRM = false
+; Off by default. When on, Gitea fetches the `picture` URL server-side on
+; every login. This server passes only https URLs with a DNS host name, but
+; make sure Gitea's egress policy blocks internal addresses before enabling it.
+UPDATE_AVATAR = false
+OPENID_CONNECT_SCOPES = openid profile email
+
 [service]
 DISABLE_REGISTRATION = false
+; Optional: allow sign-up only through external sources such as Nostr.
 ALLOW_ONLY_EXTERNAL_REGISTRATION = true
+; If EMAIL_DOMAIN_ALLOWLIST is set, it must contain nostr.invalid.
 ```
 
-## Docker
+Notes:
+
+- Gitea sends notification mail to the primary address. For Nostr users this
+  is `npub…@nostr.invalid`, which fails delivery harmlessly. Users can add and
+  verify a real address in their settings.
+- Gitea's server makes back-channel calls to the discovery, `/token` and
+  `/userinfo` URLs. `base_url` must therefore resolve and be reachable from the
+  Gitea pod, not only from browsers. In a tailnet-only setup that means
+  tailnet DNS and egress for the Gitea pod, or a `base_url` hostname that also
+  resolves inside the cluster to the same service.
+- Users can rename themselves in Gitea later. The external login stays bound
+  to `sub`, the public key.
+
+### Forgejo
+
+Forgejo uses the same goth `openidConnect` provider and the same
+`[oauth2_client]` settings (`ENABLE_AUTO_REGISTRATION`, `USERNAME`,
+`ACCOUNT_LINKING`, `UPDATE_AVATAR`). The configuration above applies
+unchanged; the auth source is configured the same way in its admin UI or with
+`forgejo admin auth add-oauth`. Again, never use `ACCOUNT_LINKING = auto`.
+
+## Configuration
+
+Configure with a YAML file (`-config`, default `config.yaml`) or, if that file
+does not exist, with environment variables. Startup fails on unsafe values:
+
+- missing `base_url`;
+- the example or a short (< 32 characters) client secret;
+- missing redirect URIs;
+- out-of-range TTLs.
+
+See [`config.example.yaml`](config.example.yaml) for all options.
+
+| YAML | Environment | Default |
+|------|-------------|---------|
+| `server.base_url` (required, becomes the OIDC issuer) | `BASE_URL` | |
+| `server.host` / `server.port` | `HOST` / `PORT` | `0.0.0.0` / `8080` |
+| `oauth2.clients[]` | `OAUTH2_CLIENT_ID`, `OAUTH2_CLIENT_SECRET` or `OAUTH2_CLIENT_SECRET_FILE`, `OAUTH2_REDIRECT_URIS` (comma separated), `OAUTH2_REQUIRE_PKCE` | |
+| `oauth2.signing_key_file` | `OAUTH2_SIGNING_KEY_FILE` | ephemeral key |
+| `oauth2.code_ttl` / `access_token_ttl` / `id_token_ttl` | `OAUTH2_CODE_TTL` / `OAUTH2_ACCESS_TOKEN_TTL` / `OAUTH2_ID_TOKEN_TTL` | `2m` / `10m` / `5m` |
+| `nostr.challenge_ttl` | `NOSTR_CHALLENGE_TTL` | `2m` |
+| `nostr.fallback_relays` | `NOSTR_FALLBACK_RELAYS` | see below |
+| `nostr.max_user_relays` | `NOSTR_MAX_USER_RELAYS` | `5` |
+| `nostr.email_domain` | `NOSTR_EMAIL_DOMAIN` | `nostr.invalid` |
+| `nostr.expose_picture` | `NOSTR_EXPOSE_PICTURE` | `true` |
+| `nostr.allow_private_relays` (testing only) | `NOSTR_ALLOW_PRIVATE_RELAYS` | `false` |
+
+**Signing key.** Without `signing_key_file`, a fresh RSA key is generated on
+every start. That is fine for Gitea, which consumes ID tokens immediately.
+Mount a persistent key if other relying parties cache the JWKS:
+`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out signing.pem`.
+To rotate, replace the file and restart. Tokens are short-lived, so no overlap
+period is needed for Gitea.
+
+**State.** Challenges, codes and tokens live in memory. Run a single replica,
+or use sticky sessions.
+
+## Build and run
 
 ```bash
-docker build -t nostr-oauth2-server .
-docker run -p 8080:8080 -v $(pwd)/config.yaml:/app/config.yaml nostr-oauth2-server
+go build ./cmd/nostr-oauth2-server
+./nostr-oauth2-server -config config.yaml
 ```
 
-## How It Works
+Container image: a static binary on `distroless/static-debian13:nonroot`,
+pinned by digest. It runs as UID 65532, needs no writable filesystem, and has
+no config baked in.
 
-### Authentication Flow
+```bash
+docker build -t gitea-nostr-auth .
+docker run --read-only -p 8080:8080 \
+  -v $(pwd)/config.yaml:/etc/nostr-auth/config.yaml:ro \
+  gitea-nostr-auth
+```
 
-1. User clicks "Login with Nostr" on Gitea
-2. Gitea redirects to nostr-oauth2-server's `/authorize` endpoint
-3. Login page uses `window.nostr` (NIP-07) to get pubkey and sign a challenge
-4. Server verifies signature and issues an OAuth2 authorization code
-5. Gitea exchanges code for access token and fetches user info
-6. User is logged in (or account is created if new)
+Kubernetes hints:
 
-### Profile Fetching
+- probe `GET /healthz`;
+- mount the config and secrets read-only;
+- `readOnlyRootFilesystem: true`, `runAsNonRoot: true`,
+  `allowPrivilegeEscalation: false`, and drop all capabilities;
+- rate-limit `/authorize` and `/verify` at the ingress. Behind a proxy the
+  server only sees the proxy's IP, so it does not rate-limit per client.
 
-When Gitea requests user info, the server:
+## How it works
 
-1. **Fetches NIP-65 relay list (kind 10002)** from fallback relays to find user's preferred relays
-2. **Queries user's read relays + fallbacks** for their profile (kind 0)
-3. **Extracts profile data**: name, display_name, picture, NIP-05, website, etc.
-4. **Caches results** for 24 hours to minimize relay queries
+1. Gitea redirects to `/authorize`. This server validates the client and the
+   exact `redirect_uri`, plus `scope=openid`, PKCE and `nonce`. It sets an
+   HttpOnly `SameSite=Strict` binding cookie and renders the login page with a
+   256-bit single-use challenge.
+2. The page asks the NIP-07 extension to sign a kind-27235 event with these
+   tags: `["u", "<base_url>/verify"]`, `["method", "POST"]`,
+   `["challenge", <nonce>]`. The content is `Sign in to <gitea host> via <auth host>`.
+3. `/verify` checks the following:
+   - the kind;
+   - the timestamp, within the challenge TTL;
+   - that the event id is the hash of the canonical serialisation, and the
+     Schnorr signature over that hash;
+   - the `u`, `method` and content values;
+   - the binding cookie.
 
-This ensures profiles are found even if only stored on the user's preferred relays.
+   It then consumes the challenge atomically and returns a redirect to Gitea
+   with a 2-minute single-use code.
+4. Gitea redeems the code at `/token`, authenticating with
+   `client_secret_basic` or `client_secret_post`. It receives an RS256 ID
+   token and a 10-minute access token, then calls `/userinfo`.
+5. For `/userinfo`, the server fetches the user's NIP-65 relay list from the
+   fallback relays. It then queries up to `max_user_relays` of the user's
+   `wss://` read relays plus the fallback relays for kind 0. Every event's id,
+   signature and author are verified. Connections to non-public addresses
+   (private, loopback, link-local and metadata, CGNAT/tailnet) are refused
+   after DNS resolution. Results are cached for 24 h, and failed lookups for
+   5 minutes.
 
-### Fallback Relays
+Default fallback relays: `wss://relay.nostr.band/`, `wss://nostr.wine/`,
+`wss://nos.lol/`, `wss://relay.primal.net/`, `wss://purplepag.es/`.
 
-Default relays used for initial queries (configurable):
-- `wss://relay.nostr.band/`
-- `wss://nostr.wine/`
-- `wss://nos.lol/`
-- `wss://relay.primal.net/`
-- `wss://purplepag.es/`
+Residual risk: NIP-07 extensions sign whatever a page asks for. A user who
+approves a kind-27235 "Sign in to … via …" signature on a hostile site lets
+that site log in as them. The statement names both hosts so the prompt makes
+this visible. Only approve it on the auth server's own page.
 
-## API Endpoints
+## API endpoints
 
 | Endpoint | Description |
 |----------|-------------|
-| `/.well-known/openid-configuration` | OIDC discovery document |
-| `/authorize` | OAuth2 authorization (shows login page) |
-| `/verify` | Verify signed Nostr event |
-| `/token` | Exchange auth code for access token |
-| `/userinfo` | Get user profile (npub, username, email) |
-
-## Security
-
-- Challenges are single-use and expire after 60 seconds
-- Event signatures are verified using secp256k1
-- Timestamps must be within a 60-second window
-- HTTPS required in production
+| `GET /.well-known/openid-configuration` | OIDC discovery |
+| `GET /.well-known/jwks.json` | public signing key |
+| `GET /authorize` | authorization endpoint (login page) |
+| `POST /verify` | verifies the signed Nostr event (called by the login page) |
+| `POST /token` | code exchange |
+| `GET/POST /userinfo` | user claims |
+| `GET /healthz` | liveness |
 
 ## License
 
-This is free and unencumbered software released into the public domain (Unlicense).
+Public domain ([Unlicense](LICENSE)). Originally written by mleku; see
+[NOTICE](NOTICE).
