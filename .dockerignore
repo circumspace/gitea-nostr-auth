@@ -1,0 +1,7 @@
+.git
+.claude
+*.md
+config.yaml
+config.*.yaml
+!config.example.yaml
+/nostr-oauth2-server

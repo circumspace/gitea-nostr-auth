@@ -2,9 +2,11 @@ module github.com/circumspace/gitea-nostr-auth
 
 go 1.25.3
 
+toolchain go1.27.2
+
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/go-chi/chi/v5 v5.1.0
+	github.com/go-chi/chi/v5 v5.3.2
 	github.com/nbd-wtf/go-nostr v0.52.3
 	gopkg.in/yaml.v3 v3.0.1
 )

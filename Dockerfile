@@ -1,37 +1,32 @@
-# Build stage
-FROM golang:1.22-alpine AS builder
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
+# Build stage: pinned by digest (golang:1.27.2-alpine, multi-arch index).
+FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS builder
 
-# Install git for go modules
-RUN apk add --no-cache git
+WORKDIR /src
+ENV CGO_ENABLED=0 GOFLAGS=-trimpath GOTOOLCHAIN=local
 
-# Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download && go mod verify
 
-# Copy source code
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o nostr-oauth2-server ./cmd/nostr-oauth2-server
+ARG TARGETOS TARGETARCH
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -ldflags="-s -w -buildid=" -o /out/nostr-oauth2-server ./cmd/nostr-oauth2-server
 
-# Runtime stage
-FROM alpine:3.19
+# Runtime stage: distroless static (CA certificates, tzdata, no shell),
+# non-root user 65532, pinned by digest (static-debian13:nonroot index).
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
 
-RUN apk --no-cache add ca-certificates
+COPY --from=builder /out/nostr-oauth2-server /nostr-oauth2-server
 
-WORKDIR /app
-
-# Copy binary from builder
-COPY --from=builder /app/nostr-oauth2-server .
-
-# Copy default config
-COPY config.example.yaml /app/config.yaml
-
-# Expose port
+USER 65532:65532
 EXPOSE 8080
 
-# Run the server
-ENTRYPOINT ["./nostr-oauth2-server"]
-CMD ["-config", "/app/config.yaml"]
+# No configuration is baked in. Mount a config file and pass
+# -config /etc/nostr-auth/config.yaml, or use environment variables
+# (see README). The process needs no writable filesystem.
+ENTRYPOINT ["/nostr-oauth2-server"]
+CMD ["-config", "/etc/nostr-auth/config.yaml"]
