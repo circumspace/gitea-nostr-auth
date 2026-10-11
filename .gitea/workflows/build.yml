@@ -1,0 +1,65 @@
+# Test, then build and push the image to this Gitea's container registry.
+# runs-on is pinned to fra6: it is the only runner with a Docker engine, and
+# every runner also carries ubuntu-latest.
+#
+# The automatic Actions token cannot write packages of a private org in
+# Gitea 28 (services/context/package.go: "TODO: ActionUser permission check"),
+# so the push uses REGISTRY_TOKEN: a write:package token of the bot user
+# circumspace-ci, whose only access is the org team package-publishers
+# (packages unit, no repositories).
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  IMAGE: git.circum.space/circumspace/gitea-nostr-auth
+  REGISTRY_USER: circumspace-ci
+
+jobs:
+  build:
+    runs-on: fra6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Tags
+        id: tags
+        run: |
+          short=${GITHUB_SHA::12}
+          tags="-t $IMAGE:$short"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            v=${GITHUB_REF_NAME#v}
+            echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a semver tag: $GITHUB_REF_NAME"; exit 1; }
+            tags="$tags -t $IMAGE:$v -t $IMAGE:${v%.*} -t $IMAGE:${v%%.*}"
+          else
+            tags="$tags -t $IMAGE:latest"
+          fi
+          echo "args=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login git.circum.space -u "$REGISTRY_USER" --password-stdin
+
+      - name: Build and push
+        run: |
+          docker buildx build --platform linux/amd64 --pull --push \
+            --label org.opencontainers.image.revision=$GITHUB_SHA \
+            --label org.opencontainers.image.source=https://git.circum.space/circumspace/gitea-nostr-auth \
+            ${{ steps.tags.outputs.args }} .
+
+      - name: Log out
+        if: always()
+        run: docker logout git.circum.space || true
