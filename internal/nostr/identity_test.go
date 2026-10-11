@@ -83,11 +83,11 @@ func TestSafePictureURL(t *testing.T) {
 
 func TestSanitizeDisplayName(t *testing.T) {
 	cases := map[string]string{
-		"  Alice  ":              "Alice",
-		"Al\u202eice":                 "Alice", // RTL override stripped
-		"Bob\u200b\u0000\n Smith":     "Bob Smith",
-		strings.Repeat("x", 200): strings.Repeat("x", 64),
-		"\xff\xfeMallory":        "Mallory",
+		"  Alice  ":               "Alice",
+		"Al\u202eice":             "Alice", // RTL override stripped
+		"Bob\u200b\u0000\n Smith": "Bob Smith",
+		strings.Repeat("x", 200):  strings.Repeat("x", 64),
+		"\xff\xfeMallory":         "Mallory",
 	}
 	for in, want := range cases {
 		if got := SanitizeDisplayName(in); got != want {
