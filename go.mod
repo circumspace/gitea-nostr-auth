@@ -1,4 +1,4 @@
-module github.com/mlekudev/gitea-nostr-auth
+module github.com/circumspace/gitea-nostr-auth
 
 go 1.25.3
 

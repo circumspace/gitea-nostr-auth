@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/mlekudev/gitea-nostr-auth/internal/nostr"
+	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
 )
 
 type UserInfoResponse struct {

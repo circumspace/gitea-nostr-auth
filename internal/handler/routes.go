@@ -7,9 +7,9 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
-	"github.com/mlekudev/gitea-nostr-auth/internal/config"
-	"github.com/mlekudev/gitea-nostr-auth/internal/nostr"
-	"github.com/mlekudev/gitea-nostr-auth/internal/oauth2"
+	"github.com/circumspace/gitea-nostr-auth/internal/config"
+	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
+	"github.com/circumspace/gitea-nostr-auth/internal/oauth2"
 )
 
 func NewRouter(cfg *config.Config, store oauth2.Store, fetcher *nostr.Fetcher) http.Handler {

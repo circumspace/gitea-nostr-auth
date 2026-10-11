@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/mlekudev/gitea-nostr-auth/internal/config"
-	"github.com/mlekudev/gitea-nostr-auth/internal/handler"
-	"github.com/mlekudev/gitea-nostr-auth/internal/nostr"
-	"github.com/mlekudev/gitea-nostr-auth/internal/oauth2"
+	"github.com/circumspace/gitea-nostr-auth/internal/config"
+	"github.com/circumspace/gitea-nostr-auth/internal/handler"
+	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
+	"github.com/circumspace/gitea-nostr-auth/internal/oauth2"
 )
 
 func main() {

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mlekudev/gitea-nostr-auth/internal/nostr"
+	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
 )
 
 type TokenRequest struct {
