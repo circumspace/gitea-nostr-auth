@@ -1,4 +1,7 @@
-# Runner test build: vet, test and build only. No image build, no push.
+# Runner test build (see the commit). The .gitea/workflows directory makes
+# Gitea ignore .github/workflows on this branch, so release/deploy workflows
+# never run here. fra6 jobs are memory-capped (no OOM on fra6, ever).
+# Vet, test and build only: no image build, no push.
 name: runner-test
 
 on:
@@ -8,18 +11,55 @@ on:
 
 jobs:
   test:
-    runs-on: fra6
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: fra6
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
-      RUNNER_LABEL: fra6
+      GOMAXPROCS: "2"
     steps:
+      # Fork-free limits probe (python reads files without spawning processes).
+      - name: Process limits
+        continue-on-error: true
+        shell: python3 {0}
+        run: |
+          import os
+          for f in ["/sys/fs/cgroup/pids.max","/sys/fs/cgroup/pids.current","/sys/fs/cgroup/pids.peak","/sys/fs/cgroup/memory.max","/sys/fs/cgroup/cpu.max","/proc/sys/kernel/pid_max","/proc/sys/kernel/threads-max"]:
+              try: print(f, open(f).read().strip())
+              except Exception as e: print(f, "n/a", e)
+          print(open("/proc/self/limits").read())
+          print("uid", os.getuid(), "status:", [l for l in open("/proc/self/status") if l.startswith(("Uid","NSpid"))])
       - name: Runner environment
         run: |
-          echo "runner=${{ matrix.runner || env.RUNNER_LABEL }} host=$(hostname)"
+          echo "runner=${{ matrix.runner }} host=$(hostname)"
           nproc; free -m; df -h / "$GITHUB_WORKSPACE" 2>/dev/null || df -h /
-          cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max 2>/dev/null || true
+          echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) cpu.max=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null) pids.max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null) ulimit-u=$(ulimit -u)"
           . /etc/os-release; echo "$PRETTY_NAME"
           for t in sudo git node docker cargo rustc go java sdkmanager gradle python3 pkg-config; do printf '%-11s %s\n' "$t" "$(command -v $t || echo MISSING)"; done
+      # fra6 must never hit its 4Gi cgroup: sample the job's anonymous memory
+      # every second and stop the build tools if it passes 3400 MiB.
+      - name: Memory guard
+        if: matrix.runner == 'fra6'
+        run: |
+          cat > /tmp/memguard.sh <<'G'
+          #!/bin/bash
+          lim=$((3400*1048576)); max=0
+          while sleep 1; do
+            a=$(awk '$1=="anon"{print $2}' /sys/fs/cgroup/memory.stat 2>/dev/null)
+            [ -n "$a" ] || a=$(( $(free -b | awk '/^Mem:/{print $3}') ))
+            if [ "$a" -gt "$max" ]; then max=$a; echo $((max/1048576)) > /tmp/memguard.max; fi
+            if [ "$a" -gt "$lim" ]; then
+              echo "anon $((a/1048576)) MiB > 3400 MiB at $(date -u +%T)" >> /tmp/memguard.trip
+              pkill -TERM -f 'rustc|cargo|java|gradle|go-build|/go/pkg/tool' || true
+            fi
+          done
+          G
+          chmod +x /tmp/memguard.sh
+          setsid nohup /tmp/memguard.sh >/dev/null 2>&1 < /dev/null &
+          sleep 2; echo "guard running, anon now $(cat /tmp/memguard.max) MiB"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -33,6 +73,8 @@ jobs:
       - name: Resource usage
         if: always()
         run: |
-          echo "memory.peak: $(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 )) MiB"
+          echo "peak anon (guard sampler): $(cat /tmp/memguard.max 2>/dev/null || echo n/a) MiB"
+          echo "memory.peak incl. page cache: $(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 )) MiB"
+          cat /tmp/memguard.trip 2>/dev/null && echo "::error::memory guard tripped" || true
           grep -E '^(oom|oom_kill) ' /sys/fs/cgroup/memory.events 2>/dev/null || true
-          df -h / ; du -sh "$GITHUB_WORKSPACE" 2>/dev/null || true
+          df -h / ; du -sh "$GITHUB_WORKSPACE" ~/.cargo ~/.gradle 2>/dev/null || true
