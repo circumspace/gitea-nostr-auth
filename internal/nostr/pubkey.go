@@ -1,13 +1,14 @@
 package nostr
 
 import (
-	"next.orly.dev/pkg/nostr/encoders/bech32encoding"
-	"next.orly.dev/pkg/nostr/encoders/hex"
+	"fmt"
+
+	"github.com/nbd-wtf/go-nostr/nip19"
 )
 
 // PubkeyToNpub converts a hex public key to bech32 npub format
 func PubkeyToNpub(hexPubkey string) string {
-	npub, err := bech32encoding.HexToNpub([]byte(hexPubkey))
+	npub, err := nip19.EncodePublicKey(hexPubkey)
 	if err != nil {
 		// If encoding fails, return truncated hex
 		if len(hexPubkey) > 16 {
@@ -15,16 +16,20 @@ func PubkeyToNpub(hexPubkey string) string {
 		}
 		return hexPubkey
 	}
-	return string(npub)
+	return npub
 }
 
 // NpubToPubkey converts a bech32 npub to hex public key
 func NpubToPubkey(npub string) (string, error) {
-	pkBytes, err := bech32encoding.NpubToBytes([]byte(npub))
+	prefix, value, err := nip19.Decode(npub)
 	if err != nil {
 		return "", err
 	}
-	return hex.Enc(pkBytes), nil
+	pk, ok := value.(string)
+	if prefix != "npub" || !ok {
+		return "", fmt.Errorf("not an npub: %q", prefix)
+	}
+	return pk, nil
 }
 
 // TruncateNpub returns a shortened npub for display

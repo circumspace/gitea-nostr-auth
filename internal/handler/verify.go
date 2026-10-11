@@ -8,8 +8,7 @@ import (
 	"net/url"
 	"time"
 
-	"next.orly.dev/pkg/nostr/encoders/event"
-	"next.orly.dev/pkg/nostr/encoders/hex"
+	gonostr "github.com/nbd-wtf/go-nostr"
 )
 
 type VerifyResponse struct {
@@ -21,15 +20,14 @@ type VerifyResponse struct {
 func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// Read the raw JSON body — event.E.Unmarshal handles hex→binary conversion
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		json.NewEncoder(w).Encode(VerifyResponse{Error: "invalid request body"})
 		return
 	}
 
-	var ev event.E
-	if _, err := ev.Unmarshal(body); err != nil {
+	var ev gonostr.Event
+	if err := json.Unmarshal(body, &ev); err != nil {
 		json.NewEncoder(w).Encode(VerifyResponse{Error: "invalid event JSON"})
 		return
 	}
@@ -41,7 +39,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify timestamp is within window
-	eventTime := time.Unix(ev.CreatedAt, 0)
+	eventTime := ev.CreatedAt.Time()
 	if time.Since(eventTime) > h.cfg.Nostr.ChallengeTTL {
 		json.NewEncoder(w).Encode(VerifyResponse{Error: "event timestamp too old"})
 		return
@@ -51,8 +49,14 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify signature
-	ok, err := ev.Verify()
+	// Verify that the id is the hash of the canonical serialisation and that
+	// the signature is valid over that hash. Never trust the supplied id alone:
+	// a signature taken from any other event by the same key would pass.
+	if !ev.CheckID() {
+		json.NewEncoder(w).Encode(VerifyResponse{Error: "invalid event id"})
+		return
+	}
+	ok, err := ev.CheckSignature()
 	if err != nil || !ok {
 		log.Printf("signature verification failed: %v", err)
 		json.NewEncoder(w).Encode(VerifyResponse{Error: "invalid signature"})
@@ -61,13 +65,10 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 
 	// Extract challenge from tags
 	var challengeNonce string
-	if ev.Tags != nil {
-		for _, t := range *ev.Tags {
-			ss := t.ToSliceOfStrings()
-			if len(ss) >= 2 && ss[0] == "challenge" {
-				challengeNonce = ss[1]
-				break
-			}
+	for _, t := range ev.Tags {
+		if len(t) >= 2 && t[0] == "challenge" {
+			challengeNonce = t[1]
+			break
 		}
 	}
 
@@ -86,8 +87,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	// Delete challenge (single use)
 	h.store.DeleteChallenge(challengeNonce)
 
-	// Convert binary pubkey to hex string for storage
-	pubkeyHex := string(hex.Enc(ev.Pubkey))
+	pubkeyHex := ev.PubKey
 
 	// Create authorization code
 	authCode, err := h.store.CreateAuthCode(

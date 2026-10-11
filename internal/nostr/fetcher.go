@@ -7,12 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"next.orly.dev/pkg/nostr/encoders/event"
-	"next.orly.dev/pkg/nostr/encoders/filter"
-	"next.orly.dev/pkg/nostr/encoders/hex"
-	"next.orly.dev/pkg/nostr/encoders/kind"
-	"next.orly.dev/pkg/nostr/encoders/tag"
-	"next.orly.dev/pkg/nostr/ws"
+	gonostr "github.com/nbd-wtf/go-nostr"
 )
 
 const (
@@ -50,16 +45,14 @@ func NewFetcher(fallbackRelays []string) *Fetcher {
 }
 
 // newPubkeyFilter builds a filter for a given kind and hex pubkey with a limit.
-func newPubkeyFilter(k int, pubkey string, limit uint) *filter.F {
-	pubkeyBytes, err := hex.Dec(pubkey)
-	if err != nil {
+func newPubkeyFilter(k int, pubkey string, limit int) *gonostr.Filter {
+	if !gonostr.IsValidPublicKey(pubkey) {
 		return nil
 	}
-	lim := limit
-	return &filter.F{
-		Kinds:   kind.NewS(kind.New(k)),
-		Authors: tag.NewFromBytesSlice(pubkeyBytes),
-		Limit:   &lim,
+	return &gonostr.Filter{
+		Kinds:   []int{k},
+		Authors: []string{pubkey},
+		Limit:   limit,
 	}
 }
 
@@ -104,7 +97,7 @@ func (f *Fetcher) doFetchRelayList(ctx context.Context, pubkey string) []Nip65Re
 	}
 
 	// Get the most recent event
-	var latest *event.E
+	var latest *gonostr.Event
 	for _, ev := range events {
 		if latest == nil || ev.CreatedAt > latest.CreatedAt {
 			latest = ev
@@ -113,9 +106,8 @@ func (f *Fetcher) doFetchRelayList(ctx context.Context, pubkey string) []Nip65Re
 
 	// Parse relay tags
 	var relays []Nip65Relay
-	if latest.Tags != nil {
-		for _, t := range *latest.Tags {
-			ss := t.ToSliceOfStrings()
+	{
+		for _, ss := range latest.Tags {
 			if len(ss) >= 2 && ss[0] == "r" {
 				relay := Nip65Relay{
 					URL:   ss[1],
@@ -203,7 +195,7 @@ func (f *Fetcher) doFetchProfile(ctx context.Context, pubkey string, relayURLs [
 	}
 
 	// Get the most recent event
-	var latest *event.E
+	var latest *gonostr.Event
 	for _, ev := range events {
 		if latest == nil || ev.CreatedAt > latest.CreatedAt {
 			latest = ev
@@ -212,7 +204,7 @@ func (f *Fetcher) doFetchProfile(ctx context.Context, pubkey string, relayURLs [
 
 	// Parse profile content
 	var content map[string]interface{}
-	if err := json.Unmarshal(latest.Content, &content); err != nil {
+	if err := json.Unmarshal([]byte(latest.Content), &content); err != nil {
 		log.Printf("Failed to parse profile content for %s: %v", pubkey, err)
 		return nil
 	}
@@ -256,9 +248,9 @@ func (f *Fetcher) doFetchProfile(ctx context.Context, pubkey string, relayURLs [
 }
 
 // queryRelays queries multiple relays and collects events
-func (f *Fetcher) queryRelays(ctx context.Context, relayURLs []string, ff *filter.F) []*event.E {
+func (f *Fetcher) queryRelays(ctx context.Context, relayURLs []string, ff *gonostr.Filter) []*gonostr.Event {
 	var (
-		events   []*event.E
+		events   []*gonostr.Event
 		eventsMu sync.Mutex
 		wg       sync.WaitGroup
 	)
@@ -269,14 +261,14 @@ func (f *Fetcher) queryRelays(ctx context.Context, relayURLs []string, ff *filte
 		go func(relayURL string) {
 			defer wg.Done()
 
-			relay, err := ws.RelayConnect(ctx, relayURL)
+			relay, err := gonostr.RelayConnect(ctx, relayURL)
 			if err != nil {
 				// Silently skip failed relays
 				return
 			}
 			defer relay.Close()
 
-			sub, err := relay.Subscribe(ctx, filter.NewS(ff))
+			sub, err := relay.Subscribe(ctx, gonostr.Filters{*ff})
 			if err != nil {
 				return
 			}
