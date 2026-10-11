@@ -1,6 +1,7 @@
 # Test, then build and push the image to this Gitea's container registry.
-# runs-on is pinned to fra6: it is the only runner with a Docker engine, and
-# every runner also carries ubuntu-latest.
+# runs-on is pinned to build: the daemon runner whose jobs get its rootless
+# podman socket. Podman's Docker API has no BuildKit, so builds use the classic
+# builder and push tag by tag.
 #
 # The automatic Actions token cannot write packages of a private org in
 # Gitea 28 (services/context/package.go: "TODO: ActionUser permission check"),
@@ -21,7 +22,7 @@ env:
 
 jobs:
   build:
-    runs-on: fra6
+    runs-on: build
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -55,11 +56,16 @@ jobs:
         run: printf '%s' "$REGISTRY_TOKEN" | docker login git.circum.space -u "$REGISTRY_USER" --password-stdin
 
       - name: Build and push
+        env:
+          DOCKER_BUILDKIT: "0"
         run: |
-          docker buildx build --platform linux/amd64 --pull --push \
+          docker build --pull \
             --label org.opencontainers.image.revision=$GITHUB_SHA \
             --label org.opencontainers.image.source=https://git.circum.space/circumspace/gitea-nostr-auth \
             ${{ steps.tags.outputs.args }} .
+          for t in ${{ steps.tags.outputs.args }}; do
+            [ "$t" = -t ] || docker push "$t"
+          done
 
       - name: Log out
         if: always()
