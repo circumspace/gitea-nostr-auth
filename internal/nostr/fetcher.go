@@ -56,24 +56,6 @@ type Fetcher struct {
 
 // NewFetcher creates a new Fetcher.
 func NewFetcher(opts Options) *Fetcher {
-	dialer := &net.Dialer{Timeout: FetchTimeout, KeepAlive: 30 * time.Second}
-	if !opts.AllowPrivate {
-		dialer.Control = guardControl
-	}
-	transport := &http.Transport{
-		Proxy:                 nil, // never route through environment proxies: the guard must see the real peer
-		DialContext:           dialer.DialContext,
-		TLSHandshakeTimeout:   FetchTimeout,
-		ResponseHeaderTimeout: FetchTimeout,
-		MaxIdleConns:          0,
-		DisableKeepAlives:     true,
-	}
-	client := &http.Client{
-		Transport: transport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
 	var fallback []string
 	for _, r := range opts.FallbackRelays {
 		if n := normalizeRelayURL(r, true); n != "" {
@@ -86,10 +68,34 @@ func NewFetcher(opts Options) *Fetcher {
 		fallbackRelays:  fallback,
 		maxUserRelays:   opts.MaxUserRelays,
 		userRelayFilter: func(u string) string { return normalizeRelayURL(u, false) },
-		httpClient:      client,
+		httpClient:      NewRelayHTTPClient(opts.AllowPrivate),
 		sem:             make(chan struct{}, maxConcurrentDials),
 		relayCache:      newTTLCache[[]Nip65Relay](maxCacheEntries),
 		profileCache:    newTTLCache[*ProfileMetadata](maxCacheEntries),
+	}
+}
+
+// NewRelayHTTPClient returns the HTTP client for relay websocket dials. Unless
+// allowPrivate is set, its dialer refuses non-public addresses after DNS
+// resolution. It never uses a proxy and never follows redirects.
+func NewRelayHTTPClient(allowPrivate bool) *http.Client {
+	dialer := &net.Dialer{Timeout: FetchTimeout, KeepAlive: 30 * time.Second}
+	if !allowPrivate {
+		dialer.Control = guardControl
+	}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   FetchTimeout,
+		ResponseHeaderTimeout: FetchTimeout,
+		MaxIdleConns:          0,
+		DisableKeepAlives:     true,
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }
 

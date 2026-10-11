@@ -25,6 +25,7 @@ const maxClockSkew = 60 * time.Second
 
 type VerifyResponse struct {
 	Success     bool   `json:"success"`
+	Pending     bool   `json:"pending,omitempty"`
 	RedirectURL string `json:"redirect_url,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
@@ -94,7 +95,15 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nonce, err := h.checkEvent(&ev, h.now())
+	h.completeLogin(w, r, &ev)
+}
+
+// completeLogin verifies a signed login event, whether it came from a NIP-07
+// extension or a NIP-46 remote signer, against the challenge it names and
+// the request's browser binding, and answers with the redirect to the
+// relying party.
+func (h *Handler) completeLogin(w http.ResponseWriter, r *http.Request, ev *gonostr.Event) {
+	nonce, err := h.checkEvent(ev, h.now())
 	if err != nil {
 		writeVerify(w, http.StatusBadRequest, VerifyResponse{Error: err.Error()})
 		return
