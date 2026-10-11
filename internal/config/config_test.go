@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const goodSecret = "0123456789abcdef0123456789abcdef"
@@ -44,6 +45,11 @@ func TestValidateRejectsUnsafeConfig(t *testing.T) {
 		"redirect fragment":  func(c *Config) { c.OAuth2.Clients[0].RedirectURIs = []string{"https://g.example.com/cb#x"} },
 		"redirect relative":  func(c *Config) { c.OAuth2.Clients[0].RedirectURIs = []string{"/cb"} },
 		"duplicate client":   func(c *Config) { c.OAuth2.Clients = append(c.OAuth2.Clients, c.OAuth2.Clients[0]) },
+		"nip46 https relay":  func(c *Config) { c.Nostr.NIP46.Relay = "https://relay.example.com" },
+		"nip46 short timeout": func(c *Config) {
+			c.Nostr.NIP46.Relay = "wss://relay.example.com"
+			c.Nostr.NIP46.Timeout = time.Second
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -53,6 +59,17 @@ func TestValidateRejectsUnsafeConfig(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestNIP46Config(t *testing.T) {
+	c := validConfig()
+	if c.Nostr.NIP46.Enabled() || c.Nostr.NIP46.Timeout != 2*time.Minute {
+		t.Fatalf("defaults: %+v", c.Nostr.NIP46)
+	}
+	c.Nostr.NIP46.Relay = "wss://relay.example.com"
+	if err := c.Validate(); err != nil || !c.Nostr.NIP46.Enabled() {
+		t.Fatalf("valid relay rejected: %v", err)
 	}
 }
 

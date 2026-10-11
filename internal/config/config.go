@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
 )
 
 // PlaceholderSecret is the client secret shipped in config.example.yaml.
@@ -88,7 +90,25 @@ type NostrConfig struct {
 	// ExposePicture controls whether the (sanitised, https-only) kind-0
 	// picture URL is returned as the "picture" claim.
 	ExposePicture *bool `yaml:"expose_picture"`
+	// NIP46 enables login with a remote signer such as Amber.
+	NIP46 NIP46Config `yaml:"nip46"`
 }
+
+// NIP46Config configures login through a NIP-46 remote signer. It is off
+// while Relay is empty.
+type NIP46Config struct {
+	// Relay carries all messages between this server and signers. Both this
+	// server and the user's signer app must reach it.
+	Relay string `yaml:"relay"`
+	// Timeout bounds one remote signer login. The login challenge's own
+	// expiry also applies.
+	Timeout time.Duration `yaml:"timeout"`
+	// AllowPrivateRelay lets Relay resolve to a private, loopback or
+	// tailnet address.
+	AllowPrivateRelay bool `yaml:"allow_private_relay"`
+}
+
+func (n NIP46Config) Enabled() bool { return n.Relay != "" }
 
 // PictureEnabled reports whether the picture claim is emitted (default true).
 func (n NostrConfig) PictureEnabled() bool {
@@ -196,6 +216,15 @@ func FromEnv() (*Config, error) {
 		cfg.Nostr.ExposePicture = &b
 	}
 	cfg.Nostr.EmailDomain = os.Getenv("NOSTR_EMAIL_DOMAIN")
+	cfg.Nostr.NIP46.Relay = os.Getenv("NOSTR_NIP46_RELAY")
+	parseDur("NOSTR_NIP46_TIMEOUT", &cfg.Nostr.NIP46.Timeout)
+	if v := os.Getenv("NOSTR_NIP46_ALLOW_PRIVATE_RELAY"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("NOSTR_NIP46_ALLOW_PRIVATE_RELAY: %w", err))
+		}
+		cfg.Nostr.NIP46.AllowPrivateRelay = b
+	}
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
@@ -241,6 +270,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.Nostr.EmailDomain == "" {
 		c.Nostr.EmailDomain = "nostr.invalid"
+	}
+	if c.Nostr.NIP46.Timeout == 0 {
+		c.Nostr.NIP46.Timeout = 2 * time.Minute
 	}
 }
 
@@ -318,6 +350,12 @@ func (c *Config) Validate() error {
 	}
 	if strings.ContainsAny(c.Nostr.EmailDomain, "@ /") {
 		errs = append(errs, fmt.Errorf("nostr.email_domain %q is invalid", c.Nostr.EmailDomain))
+	}
+	if r := c.Nostr.NIP46.Relay; r != "" && nostr.NormalizeOperatorRelayURL(r) == "" {
+		errs = append(errs, fmt.Errorf("nostr.nip46.relay %q must be a ws:// or wss:// URL", r))
+	}
+	if t := c.Nostr.NIP46.Timeout; t < 30*time.Second || t > 10*time.Minute {
+		errs = append(errs, fmt.Errorf("nostr.nip46.timeout %s must be between 30s and 10m", t))
 	}
 	return errors.Join(errs...)
 }

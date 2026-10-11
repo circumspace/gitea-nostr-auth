@@ -34,6 +34,11 @@ func (p *ProfileMetadata) GetDisplayName() string {
 
 const maxRelayURLLength = 256
 
+// NormalizeOperatorRelayURL validates a relay URL from the operator's
+// configuration. Plain ws:// is accepted. It returns "" if the URL is not
+// acceptable.
+func NormalizeOperatorRelayURL(raw string) string { return normalizeRelayURL(raw, true) }
+
 // normalizeRelayURL validates a relay URL. allowWS permits plain ws:// (only
 // for operator-configured relays or tests). It returns "" if the URL is not
 // acceptable.

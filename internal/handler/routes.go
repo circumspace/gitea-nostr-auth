@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/circumspace/gitea-nostr-auth/internal/config"
+	"github.com/circumspace/gitea-nostr-auth/internal/nip46"
 	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
 	"github.com/circumspace/gitea-nostr-auth/internal/oauth2"
 	"github.com/circumspace/gitea-nostr-auth/internal/oidc"
@@ -32,6 +33,8 @@ type Handler struct {
 	signer    *oidc.Signer
 	loginTmpl *template.Template
 	now       func() time.Time
+	// remoteSigner is nil while NIP-46 login is disabled.
+	remoteSigner *nip46.Manager
 }
 
 func NewRouter(cfg *config.Config, store oauth2.Store, fetcher ProfileFetcher, signer *oidc.Signer) http.Handler {
@@ -42,6 +45,15 @@ func NewRouter(cfg *config.Config, store oauth2.Store, fetcher ProfileFetcher, s
 		signer:    signer,
 		loginTmpl: template.Must(template.New("login").Parse(loginPageHTML)),
 		now:       time.Now,
+	}
+	if n := cfg.Nostr.NIP46; n.Enabled() {
+		h.remoteSigner = nip46.New(nip46.Options{
+			Relay:        nostr.NormalizeOperatorRelayURL(n.Relay),
+			AllowPrivate: n.AllowPrivateRelay,
+			AppName:      hostOf(cfg.Server.BaseURL),
+			AppURL:       cfg.Server.BaseURL,
+			Kind:         KindHTTPAuth,
+		})
 	}
 
 	r := chi.NewRouter()
@@ -63,6 +75,10 @@ func NewRouter(cfg *config.Config, store oauth2.Store, fetcher ProfileFetcher, s
 
 	r.Get("/authorize", h.Authorize)
 	r.Post("/verify", h.Verify)
+	if h.remoteSigner != nil {
+		r.Post("/nip46/start", h.RemoteSignerStart)
+		r.Post("/nip46/wait", h.RemoteSignerWait)
+	}
 	r.Post("/token", h.Token)
 	r.Get("/userinfo", h.UserInfo)
 	r.Post("/userinfo", h.UserInfo)

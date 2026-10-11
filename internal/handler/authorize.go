@@ -126,6 +126,34 @@ const loginPageHTML = `<!DOCTYPE html>
             margin-bottom: 24px;
             word-break: break-all;
         }
+        button.secondary {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .or {
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 13px;
+            margin: 24px 0 12px;
+        }
+        .remote {
+            margin-top: 16px;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 13px;
+        }
+        .remote img {
+            background: #fff;
+            border-radius: 8px;
+            padding: 8px;
+            width: 100%;
+            max-width: 280px;
+            image-rendering: pixelated;
+        }
+        .remote a {
+            display: block;
+            margin: 12px 0;
+            color: #a78bfa;
+            font-weight: 600;
+        }
         .pubkey {
             font-family: monospace;
             font-size: 12px;
@@ -156,6 +184,18 @@ const loginPageHTML = `<!DOCTYPE html>
             <button id="login-btn" disabled>Checking for extension...</button>
             <div id="status" class="status hidden"></div>
         </div>
+{{if .RemoteSigner}}
+        <div id="remote-section">
+            <p class="or">or with a signer app on your phone, such as Amber</p>
+            <button id="remote-btn" class="secondary">Sign in with a signer app</button>
+            <div id="remote" class="remote hidden">
+                <img id="remote-qr" alt="QR code to connect your signer app">
+                <a id="remote-link" href="#">Open in signer app on this device</a>
+                <p>Scan the code with Amber, or open the link on the phone that has it. Approve the connection and the &ldquo;{{.Statement}}&rdquo; signature. Do not show this code to anyone else.</p>
+            </div>
+            <div id="remote-status" class="status hidden"></div>
+        </div>
+{{end}}
     </div>
 
     <script nonce="{{.CSPNonce}}">
@@ -249,6 +289,80 @@ const loginPageHTML = `<!DOCTYPE html>
 
         loginBtn.addEventListener('click', login);
         checkExtension();
+{{if .RemoteSigner}}
+        const remoteStartURL = {{.RemoteStartURL}};
+        const remoteWaitURL = {{.RemoteWaitURL}};
+        const remoteBtn = document.getElementById('remote-btn');
+        const remoteDiv = document.getElementById('remote');
+        const remoteStatus = document.getElementById('remote-status');
+
+        function showRemoteStatus(message, type) {
+            remoteStatus.textContent = message;
+            remoteStatus.className = 'status ' + type;
+        }
+
+        function remoteFail(message) {
+            remoteDiv.classList.add('hidden');
+            showRemoteStatus('Error: ' + message + '. Reload the page to try again.', 'error');
+        }
+
+        async function postJSON(url, body) {
+            const response = await fetch(url, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            return [response, await response.json()];
+        }
+
+        async function remoteLogin() {
+            remoteBtn.disabled = true;
+            let started;
+            try {
+                const [response, result] = await postJSON(remoteStartURL, { challenge: challenge });
+                if (!response.ok) {
+                    remoteFail(result.error || ('HTTP ' + response.status));
+                    return;
+                }
+                started = result;
+            } catch (err) {
+                remoteFail(err && err.message ? err.message : String(err));
+                return;
+            }
+
+            document.getElementById('remote-qr').src = started.qr;
+            document.getElementById('remote-link').href = started.uri;
+            remoteDiv.classList.remove('hidden');
+            showRemoteStatus('Waiting for your signer app...', 'info');
+
+            const deadline = Date.now() + started.expires_in * 1000;
+            while (Date.now() < deadline) {
+                let response, result;
+                try {
+                    [response, result] = await postJSON(remoteWaitURL, { session: started.session });
+                } catch (err) {
+                    // The tab may have been suspended while the signer app was open.
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    continue;
+                }
+                if (result.pending) {
+                    continue;
+                }
+                if (response.ok && result.redirect_url) {
+                    remoteDiv.classList.add('hidden');
+                    showRemoteStatus('Success! Redirecting...', 'success');
+                    window.location.assign(result.redirect_url);
+                } else {
+                    remoteFail(result.error || ('HTTP ' + response.status));
+                }
+                return;
+            }
+            remoteFail('the signer app did not respond in time');
+        }
+
+        remoteBtn.addEventListener('click', remoteLogin);
+{{end}}
     </script>
 </body>
 </html>`
@@ -375,6 +489,10 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		ClientHost string
 		IssuerHost string
 		CSPNonce   string
+
+		RemoteSigner   bool
+		RemoteStartURL string
+		RemoteWaitURL  string
 	}{
 		Challenge:  challenge.Nonce,
 		VerifyURL:  h.verifyURL(),
@@ -382,12 +500,16 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		ClientHost: hostOf(redirectURI),
 		IssuerHost: hostOf(h.cfg.Server.BaseURL),
 		CSPNonce:   cspNonce,
+
+		RemoteSigner:   h.remoteSigner != nil,
+		RemoteStartURL: h.cfg.Server.BaseURL + "/nip46/start",
+		RemoteWaitURL:  h.cfg.Server.BaseURL + "/nip46/wait",
 	}
 
 	hd := w.Header()
 	hd.Set("Content-Type", "text/html; charset=utf-8")
 	hd.Set("Content-Security-Policy", fmt.Sprintf(
-		"default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; connect-src 'self'; img-src 'self'; "+
+		"default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; connect-src 'self'; img-src 'self' data:; "+
 			"base-uri 'none'; form-action 'none'; frame-ancestors 'none'", cspNonce, cspNonce))
 	if err := h.loginTmpl.Execute(w, data); err != nil {
 		log.Printf("failed to execute template: %v", err)

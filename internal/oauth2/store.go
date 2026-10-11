@@ -73,6 +73,9 @@ type Store interface {
 	// ConsumeChallenge atomically looks up and deletes a challenge. It
 	// returns nil if the challenge does not exist or has expired.
 	ConsumeChallenge(nonce string) (*Challenge, error)
+	// GetChallenge returns a copy of a live challenge without consuming it,
+	// or nil.
+	GetChallenge(nonce string) (*Challenge, error)
 
 	CreateAuthCode(req AuthRequest, pubkey string, authTime time.Time, ttl time.Duration) (*AuthCode, error)
 	// ConsumeAuthCode atomically marks a code as used and returns it. A
@@ -202,6 +205,17 @@ func (s *MemoryStore) ConsumeChallenge(nonce string) (*Challenge, error) {
 		return nil, nil
 	}
 	return c, nil
+}
+
+func (s *MemoryStore) GetChallenge(nonce string) (*Challenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.challenges[nonce]
+	if !ok || time.Now().After(c.ExpiresAt) {
+		return nil, nil
+	}
+	cp := *c
+	return &cp, nil
 }
 
 func (s *MemoryStore) CreateAuthCode(req AuthRequest, pubkey string, authTime time.Time, ttl time.Duration) (*AuthCode, error) {
