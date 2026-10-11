@@ -494,3 +494,76 @@ requiring a human push.
 - **Refresh tokens / client credentials grant:** not implemented, which is fine.
 - **NIP-42:** not used. NIP-98 kind 27235 is the right primitive for this
   challenge, provided `u`, `method` and the challenge are verified (H-4).
+
+## Remediation status (branch `feat/go-nostr-hardening`)
+
+| ID | Status | Commit | Notes |
+|----|--------|--------|-------|
+| C-1 | Fixed | `a1c571b` | Port to `nbd-wtf/go-nostr`. `/verify` requires `CheckID()` and `CheckSignature()` (the hash is recomputed from the serialisation). Relay events get the same checks (`555c1eb`). Regression test: `TestVerifyRejections/forged_id_*`, `TestFetchProfileVerifiesEvents`. |
+| C-2 | Fixed | `555c1eb` | `preferred_username`/`nickname` = `npub[:25]`, `email` = `<npub>@nostr.invalid`, `email_verified=false` always. Profile data is display-only and sanitised. README forbids `ACCOUNT_LINKING=auto`. |
+| H-1 | Fixed | `3f9d328` | RS256 ID tokens, JWKS with RFC 7638 `kid`, full claim set. |
+| H-2 | Fixed | `555c1eb` | 100-bit username prefix; full npub in the email. |
+| H-3 | Fixed | `555c1eb` | Guarded dialer (non-public IPs refused after DNS), wss-only user relays, max 5 user relays, read/event limits, global dial semaphore, no proxy, no redirects. |
+| H-4 | Mitigated | `3f9d328` | `u`, `method`, single `challenge` and the exact sign-in statement are verified. Browser-binding cookie added; CORS removed. **Residual:** NIP-07 extensions remain signing oracles. A user who approves the "Sign in to … via …" prompt on a hostile site can still be phished. This is inherent to NIP-07 and documented in the README. |
+| M-1 | Fixed | `3f9d328` | Atomic `ConsumeChallenge`/`ConsumeAuthCode`. Code reuse revokes the issued token. Code TTL is 2 min. |
+| M-2 | Fixed | `3f9d328` | PKCE S256 (plain rejected), per-client `require_pkce`, downgrade protection. Gitea itself does not send PKCE. |
+| M-3 | Fixed | `3f9d328` | `nonce` stored and echoed. |
+| M-4 | Fixed | `c1165ad` | Startup validation rejects an empty, short or placeholder secret. `client_secret_file` supported. |
+| M-5 | Fixed | `c1165ad` | Server timeouts, header limit, graceful shutdown. |
+| M-6 | Partially fixed | `3f9d328`, `555c1eb` | Store and cache capacity limits, 16 KiB body limit, `state`/`nonce` length limits. **Open:** no built-in per-client rate limiting. Behind the ingress the server sees only the proxy IP, so this belongs at the ingress (documented). |
+| M-7 | Mitigated | `555c1eb` | Only `https://` pictures with a DNS hostname on port 443; no IP literals or internal suffixes. **Residual:** a public hostname that resolves to an internal IP can only be stopped by the relying party's egress policy. Gitea v28 has one; `UPDATE_AVATAR=false` is the default and recommended. `nostr.expose_picture: false` drops the claim. |
+| M-8 | Fixed | `a1c571b` | `next.orly.dev` and the replace directive removed. `nbd-wtf/go-nostr v0.52.3` is pinned (see dependency note). |
+| M-9 | Fixed | `c390aab` | Distroless static nonroot runtime, both images pinned by digest, no baked config. Built and smoke-tested locally with podman. |
+| L-1 | Fixed | `3f9d328` | RFC 6749 status codes, `no-store`, single auth method, form-decoded Basic credentials. |
+| L-2 | Fixed | `3f9d328` | CSP with nonce, `frame-ancestors 'none'`, `no-referrer`, `no-store`; template parsed once. |
+| L-3 | Fixed | `3f9d328`, `c390aab` | `RealIP` removed; chi v5.3.2. |
+| L-4 | Fixed | `c390aab` | `toolchain go1.27.2`; the Docker build uses go1.27.2. |
+| L-5 | Fixed | `555c1eb` | Negative results cached for 5 min; bounded caches. Rollback to an older valid kind 0 now affects display data only. |
+| L-6 | Fixed | `555c1eb` | `email_verified` always present; `profile` and `website` dropped. |
+| L-7 | Fixed | `555c1eb`, `c1165ad`, `3f9d328` | Env parse errors fail startup, strict YAML, `base_url` required and normalised, `openid` scope required. |
+| L-8 | Fixed | `3f9d328` | Path-only access log; identities logged as truncated npub. |
+| L-9 | Partially fixed | `3f9d328` | 10 min access tokens, revocation on code reuse. **Open:** no revocation endpoint, in-memory state (single replica only). Acceptable for Gitea, which uses the token once. |
+| I-1 | Open | | Owner decision: `.claude/commands/release.md` still pushes to `main` automatically. |
+
+Remaining relying-party limitations, out of this server's control:
+
+- Gitea's goth `openidConnect` provider does not verify ID token signatures.
+  It relies on TLS to the token endpoint, and on `/userinfo`, whose `sub` must
+  match.
+- It sends neither PKCE nor `nonce`.
+
+Both are supported here for relying parties that do use them.
+
+### Dependency note
+
+`github.com/nbd-wtf/go-nostr` v0.52.3 (2025-11-13) is the latest tag. The
+upstream README says the repository is in **maintenance mode** and points to
+`fiatjaf.com/nostr` as its successor. That successor is untagged, so you would
+have to track `@master`. This project uses only stable primitives from go-nostr:
+
+- `Event`, `CheckID` and `CheckSignature`;
+- `Filter.Matches`;
+- `ReqEnvelope`;
+- `nip19`.
+
+The relay connection itself uses `github.com/coder/websocket` v1.8.15 directly.
+A later move to `fiatjaf.com/nostr` should be mechanical.
+
+### Tool results after changes
+
+- `go vet ./...`: clean.
+- `staticcheck ./...` (2026.2.1): clean.
+- `govulncheck ./...` (go1.27.2): **No vulnerabilities found.**
+- `go test ./...` and `go test -race ./...`: pass. The tests cover:
+  - challenge verification: forged id, bad signature, tampered content, wrong
+    pubkey, wrong kind, too old or future timestamp, wrong `u`/`method`/content,
+    unknown, duplicate or missing challenge;
+  - replay, expired challenge, missing binding cookie;
+  - exact-match `redirect_uri` at `/authorize` and `/token`;
+  - code reuse with token revocation, and concurrent single use;
+  - PKCE: missing, wrong and correct verifiers, downgrade, `require_pkce`;
+  - ID token signature and claims, deterministic userinfo claims despite a
+    hostile profile, discovery and JWKS;
+  - no CORS, security headers, body limit;
+  - SSRF guard, relay URL filtering and capping, event verification from
+    relays, config validation.
