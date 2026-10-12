@@ -146,7 +146,8 @@ type Signer struct {
 	UserKey string
 	// Secret, if set, replaces the secret from the connect URI.
 	Secret string
-	// UseNIP04 encrypts responses with NIP-04 instead of NIP-44.
+	// UseNIP04 encrypts responses with NIP-04 instead of NIP-44, which the
+	// server does not accept.
 	UseNIP04 bool
 	// Refuse answers sign_event with this error.
 	Refuse string

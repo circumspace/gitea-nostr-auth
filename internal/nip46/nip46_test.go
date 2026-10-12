@@ -56,42 +56,51 @@ func runSigner(t *testing.T, signer *nip46test.Signer, uri string) chan error {
 }
 
 func TestRemoteSignerSignsTemplate(t *testing.T) {
-	for _, nip04 := range []bool{false, true} {
-		relay := nip46test.NewRelay(t)
-		m := newManager(t, relay.URL)
-		sess, err := m.Start("c1", "b1", testTemplate, time.Now().Add(10*time.Second))
-		if err != nil {
-			t.Fatal(err)
-		}
+	relay := nip46test.NewRelay(t)
+	m := newManager(t, relay.URL)
+	sess, err := m.Start("c1", "b1", testTemplate, time.Now().Add(10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		u, _ := url.Parse(sess.URI)
-		if u.Scheme != "nostrconnect" || u.Query().Get("relay") != relay.URL || len(u.Query().Get("secret")) != 32 ||
-			u.Query().Get("perms") != "sign_event:27235" || u.Query().Get("name") != "auth.example.com" {
-			t.Fatalf("bad connect URI %q", sess.URI)
-		}
+	u, _ := url.Parse(sess.URI)
+	if u.Scheme != "nostrconnect" || u.Query().Get("relay") != relay.URL || len(u.Query().Get("secret")) != 32 ||
+		u.Query().Get("perms") != "sign_event:27235" || u.Query().Get("name") != "auth.example.com" {
+		t.Fatalf("bad connect URI %q", sess.URI)
+	}
 
-		sk, pk := userKey(t)
-		signer := &nip46test.Signer{UserKey: sk, UseNIP04: nip04}
-		errc := runSigner(t, signer, sess.URI)
-		ev, err := wait(t, sess)
-		if err != nil {
-			t.Fatalf("nip04=%v: %v", nip04, err)
-		}
-		if err := <-errc; err != nil {
-			t.Fatal(err)
-		}
-		if ev.PubKey != pk || ev.Kind != 27235 || ev.Content != testTemplate.Content || !tagsEqual(ev.Tags, testTemplate.Tags) {
-			t.Fatalf("unexpected signed event %+v", ev)
-		}
-		if ok, _ := ev.CheckSignature(); !ok {
-			t.Fatal("signature invalid")
-		}
-		if d := time.Since(ev.CreatedAt.Time()); d < -2*time.Second || d > 5*time.Second {
-			t.Fatalf("created_at %v not current", ev.CreatedAt.Time())
-		}
-		if signer.Request.Method != "sign_event" {
-			t.Fatalf("method %q", signer.Request.Method)
-		}
+	sk, pk := userKey(t)
+	signer := &nip46test.Signer{UserKey: sk}
+	errc := runSigner(t, signer, sess.URI)
+	ev, err := wait(t, sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if ev.PubKey != pk || ev.Kind != 27235 || ev.Content != testTemplate.Content || !tagsEqual(ev.Tags, testTemplate.Tags) {
+		t.Fatalf("unexpected signed event %+v", ev)
+	}
+	if ok, _ := ev.CheckSignature(); !ok {
+		t.Fatal("signature invalid")
+	}
+	if d := time.Since(ev.CreatedAt.Time()); d < -2*time.Second || d > 5*time.Second {
+		t.Fatalf("created_at %v not current", ev.CreatedAt.Time())
+	}
+	if signer.Request.Method != "sign_event" {
+		t.Fatalf("method %q", signer.Request.Method)
+	}
+}
+
+func TestNIP04ResponsesIgnored(t *testing.T) {
+	relay := nip46test.NewRelay(t)
+	m := newManager(t, relay.URL)
+	sess, _ := m.Start("c1", "b1", testTemplate, time.Now().Add(2*time.Second))
+	sk, _ := userKey(t)
+	runSigner(t, &nip46test.Signer{UserKey: sk, UseNIP04: true}, sess.URI)
+	if _, err := wait(t, sess); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want timeout", err)
 	}
 }
 
@@ -195,5 +204,28 @@ func TestRelayAddressGuard(t *testing.T) {
 	_, err := wait(t, sess)
 	if err == nil || !strings.Contains(err.Error(), "could not connect") {
 		t.Fatalf("loopback relay was dialled: %v", err)
+	}
+}
+
+func TestMalformedNIP04ContentDoesNotCrash(t *testing.T) {
+	relay := nip46test.NewRelay(t)
+	m := newManager(t, relay.URL)
+	sess, err := m.Start("c1", "b1", testTemplate, time.Now().Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(sess.URI)
+	clientPK := u.Host
+	attackerSK, _ := userKey(t)
+	time.Sleep(200 * time.Millisecond)
+	for _, content := range []string{"AAAA?iv=AAAA", "AAAAAAAAAAAAAAAAAAAAAA==?iv=AAAAAAAAAAAAAAAAAAAAAA==", "?iv=", "QUJD?iv=AAAAAAAAAAAAAAAAAAAAAA=="} {
+		ev := gonostr.Event{Kind: KindNostrConnect, CreatedAt: gonostr.Now(), Tags: gonostr.Tags{{"p", clientPK}}, Content: content}
+		if err := ev.Sign(attackerSK); err != nil {
+			t.Fatal(err)
+		}
+		relay.Publish(&ev)
+	}
+	if _, err := wait(t, sess); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want the session to keep waiting until its deadline", err)
 	}
 }

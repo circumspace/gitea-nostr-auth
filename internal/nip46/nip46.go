@@ -18,7 +18,6 @@ import (
 
 	"github.com/coder/websocket"
 	gonostr "github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip04"
 	"github.com/nbd-wtf/go-nostr/nip44"
 
 	"github.com/circumspace/gitea-nostr-auth/internal/nostr"
@@ -167,6 +166,12 @@ func (m *Manager) Start(key, bindingHash string, tmpl gonostr.Event, expires tim
 
 	c := &conversation{m: m, sk: sk, pk: pk, secret: secret, tmpl: tmpl}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("nip46: session panicked: %v", r)
+				s.finish(nil, errors.New("internal error"))
+			}
+		}()
 		ev, err := c.run(ctx)
 		if err != nil {
 			log.Printf("nip46: session ended: %v", err)
@@ -386,13 +391,6 @@ func (c *conversation) decrypt(ev *gonostr.Event) (response, bool) {
 		return resp, false
 	}
 	plain, err = nip44.Decrypt(ev.Content, key)
-	if err != nil && strings.Contains(ev.Content, "?iv=") {
-		shared, serr := nip04.ComputeSharedSecret(ev.PubKey, c.sk)
-		if serr != nil {
-			return resp, false
-		}
-		plain, err = nip04.Decrypt(ev.Content, shared)
-	}
 	if err != nil || json.Unmarshal([]byte(plain), &resp) != nil {
 		return resp, false
 	}
