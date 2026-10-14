@@ -56,7 +56,18 @@ type Options struct {
 	// Kind is the only event kind the signer is asked to allow.
 	Kind        int
 	MaxSessions int
+	// RequestDelay is the wait between the signer's connect answer and the
+	// first sign request. Amber starts listening for requests only after it
+	// has sent the answer, and misses a request that arrives sooner.
+	RequestDelay time.Duration
+	// ResendInterval is how often an unanswered sign request is sent again.
+	ResendInterval time.Duration
 }
+
+const (
+	DefaultRequestDelay   = 2 * time.Second
+	DefaultResendInterval = 10 * time.Second
+)
 
 type Manager struct {
 	opts       Options
@@ -100,6 +111,12 @@ func (s *Session) finish(ev *gonostr.Event, err error) {
 func New(opts Options) *Manager {
 	if opts.MaxSessions <= 0 {
 		opts.MaxSessions = DefaultMaxSessions
+	}
+	if opts.RequestDelay <= 0 {
+		opts.RequestDelay = DefaultRequestDelay
+	}
+	if opts.ResendInterval <= 0 {
+		opts.ResendInterval = DefaultResendInterval
 	}
 	return &Manager{
 		opts:       opts,
@@ -164,7 +181,7 @@ func (m *Manager) Start(key, bindingHash string, tmpl gonostr.Event, expires tim
 	}
 	m.sessions[id] = s
 
-	c := &conversation{m: m, sk: sk, pk: pk, secret: secret, tmpl: tmpl}
+	c := &conversation{m: m, sk: sk, pk: pk, secret: secret, tmpl: tmpl, requestEvIDs: map[string]bool{}}
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -251,9 +268,9 @@ type conversation struct {
 	secret string
 	tmpl   gonostr.Event
 
-	signer      string
-	requestID   string
-	requestEvID string
+	signer       string
+	requestID    string
+	requestEvIDs map[string]bool
 }
 
 func (c *conversation) run(ctx context.Context) (*gonostr.Event, error) {
@@ -290,10 +307,39 @@ func (c *conversation) run(ctx context.Context) (*gonostr.Event, error) {
 	}
 	c.logf("subscribed on %s", c.m.opts.Relay)
 
+	msgs := make(chan []byte)
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			select {
+			case msgs <- data:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	var send <-chan time.Time
+	attempts := 0
 	for handled := 0; handled < maxEventsHandled; {
-		_, data, err := conn.Read(ctx)
-		if err != nil {
+		var data []byte
+		select {
+		case err := <-readErr:
 			return nil, c.relayErr(ctx, err)
+		case <-send:
+			attempts++
+			c.logf("sending the sign request (attempt %d)", attempts)
+			if err := c.requestSignature(ctx); err != nil {
+				return nil, err
+			}
+			send = time.After(c.m.opts.ResendInterval)
+			continue
+		case data = <-msgs:
 		}
 		var msg []json.RawMessage
 		if json.Unmarshal(data, &msg) != nil || len(msg) < 2 {
@@ -313,7 +359,7 @@ func (c *conversation) run(ctx context.Context) (*gonostr.Event, error) {
 			if len(msg) > 3 {
 				_ = json.Unmarshal(msg[3], &reason)
 			}
-			if id == c.requestEvID && !accepted {
+			if c.requestEvIDs[id] && !accepted {
 				return nil, fmt.Errorf("the signer relay rejected the signing request: %s", truncate(reason))
 			}
 		case "CLOSED":
@@ -332,9 +378,13 @@ func (c *conversation) run(ctx context.Context) (*gonostr.Event, error) {
 				c.logf("dropped an invalid or unexpected event from the relay")
 				continue
 			}
+			connected := c.signer != ""
 			signed, err := c.handle(ctx, &ev)
 			if signed != nil || err != nil {
 				return signed, err
+			}
+			if !connected && c.signer != "" {
+				send = time.After(c.m.opts.RequestDelay)
 			}
 		}
 	}
@@ -356,9 +406,14 @@ func (c *conversation) handle(ctx context.Context, ev *gonostr.Event) (*gonostr.
 			c.logf("ignored a message from %s without the session secret (id %q, error %q)", short(ev.PubKey), truncate(resp.ID), truncate(resp.Error))
 			return nil, nil
 		}
+		id, err := oauth2.GenerateToken(8)
+		if err != nil {
+			return nil, err
+		}
 		c.signer = ev.PubKey
-		c.logf("signer %s connected, sending the sign request", short(ev.PubKey))
-		return nil, c.requestSignature(ctx)
+		c.requestID = id
+		c.logf("signer %s connected", short(ev.PubKey))
+		return nil, nil
 	}
 
 	if ev.PubKey != c.signer {
@@ -398,12 +453,6 @@ func (c *conversation) decrypt(ev *gonostr.Event) (response, bool) {
 }
 
 func (c *conversation) requestSignature(ctx context.Context) error {
-	id, err := oauth2.GenerateToken(8)
-	if err != nil {
-		return err
-	}
-	c.requestID = id
-
 	unsigned, err := json.Marshal(unsignedEvent{
 		Kind:      c.tmpl.Kind,
 		CreatedAt: gonostr.Now(),
@@ -413,7 +462,7 @@ func (c *conversation) requestSignature(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(request{ID: id, Method: "sign_event", Params: []string{string(unsigned)}})
+	body, err := json.Marshal(request{ID: c.requestID, Method: "sign_event", Params: []string{string(unsigned)}})
 	if err != nil {
 		return err
 	}
@@ -434,7 +483,7 @@ func (c *conversation) requestSignature(ctx context.Context) error {
 	if err := ev.Sign(c.sk); err != nil {
 		return err
 	}
-	c.requestEvID = ev.ID
+	c.requestEvIDs[ev.ID] = true
 	msg, err := json.Marshal([]any{"EVENT", ev})
 	if err != nil {
 		return err

@@ -20,7 +20,8 @@ var testTemplate = gonostr.Event{
 }
 
 func newManager(t *testing.T, relay string, mutate ...func(*Options)) *Manager {
-	opts := Options{Relay: relay, AllowPrivate: true, AppName: "auth.example.com", Kind: 27235}
+	opts := Options{Relay: relay, AllowPrivate: true, AppName: "auth.example.com", Kind: 27235,
+		RequestDelay: 20 * time.Millisecond, ResendInterval: 200 * time.Millisecond}
 	for _, m := range mutate {
 		m(&opts)
 	}
@@ -227,5 +228,32 @@ func TestMalformedNIP04ContentDoesNotCrash(t *testing.T) {
 	}
 	if _, err := wait(t, sess); !errors.Is(err, ErrTimeout) {
 		t.Fatalf("got %v, want the session to keep waiting until its deadline", err)
+	}
+}
+
+func TestLateListeningSignerGetsResentRequest(t *testing.T) {
+	relay := nip46test.NewRelay(t)
+	m := newManager(t, relay.URL)
+	sess, _ := m.Start("c1", "b1", testTemplate, time.Now().Add(5*time.Second))
+	sk, pk := userKey(t)
+	signer := &nip46test.Signer{UserKey: sk, ListenAfterConnect: 300 * time.Millisecond}
+	runSigner(t, signer, sess.URI)
+	ev, err := wait(t, sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.PubKey != pk {
+		t.Fatalf("signed by %s", ev.PubKey)
+	}
+}
+
+func TestLateListeningSignerMissesSingleEarlyRequest(t *testing.T) {
+	relay := nip46test.NewRelay(t)
+	m := newManager(t, relay.URL, func(o *Options) { o.ResendInterval = time.Minute })
+	sess, _ := m.Start("c1", "b1", testTemplate, time.Now().Add(1500*time.Millisecond))
+	sk, _ := userKey(t)
+	runSigner(t, &nip46test.Signer{UserKey: sk, ListenAfterConnect: 300 * time.Millisecond}, sess.URI)
+	if _, err := wait(t, sess); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v; the test signer should miss a request sent before it listens", err)
 	}
 }

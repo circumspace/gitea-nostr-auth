@@ -102,9 +102,13 @@ func (r *Relay) serve(w http.ResponseWriter, req *http.Request) {
 				r.subs[rc] = map[string]gonostr.Filters{}
 			}
 			r.subs[rc][sid] = filters
+			liveOnly := false
+			for _, f := range filters {
+				liveOnly = liveOnly || f.LimitZero
+			}
 			var stored []*gonostr.Event
 			for _, ev := range r.events {
-				if filters.Match(ev) {
+				if !liveOnly && filters.Match(ev) {
 					stored = append(stored, ev)
 				}
 			}
@@ -151,6 +155,10 @@ type Signer struct {
 	UseNIP04 bool
 	// Refuse answers sign_event with this error.
 	Refuse string
+	// ListenAfterConnect makes the signer behave like Amber: it sends its
+	// connect answer first and only then, after this delay, subscribes for
+	// new requests, so it misses any request sent in between.
+	ListenAfterConnect time.Duration
 	// Mutate changes the event template before it is signed.
 	Mutate func(*gonostr.Event)
 
@@ -250,12 +258,27 @@ func (s *Signer) Connect(ctx context.Context, uri string) error {
 		return awaitOK(lastSent)
 	}
 
-	if err := send([]any{"REQ", "s", gonostr.Filter{Kinds: []int{kindNostrConnect}, Tags: gonostr.TagMap{"p": {signerPK}}}}); err != nil {
-		return err
+	subscribe := func() error {
+		f := gonostr.Filter{Kinds: []int{kindNostrConnect}, Tags: gonostr.TagMap{"p": {signerPK}}, LimitZero: s.ListenAfterConnect > 0}
+		return send([]any{"REQ", "s", f})
+	}
+	if s.ListenAfterConnect == 0 {
+		if err := subscribe(); err != nil {
+			return err
+		}
 	}
 	connectID, _ := json.Marshal(time.Now().UnixNano())
 	if err := respond(rpcResponse{ID: string(connectID), Result: secret}); err != nil {
 		return err
+	}
+	if s.ListenAfterConnect > 0 {
+		if err := awaitOK(lastSent); err != nil {
+			return err
+		}
+		time.Sleep(s.ListenAfterConnect)
+		if err := subscribe(); err != nil {
+			return err
+		}
 	}
 
 	key, _ := nip44.GenerateConversationKey(clientPK, signerSK)
